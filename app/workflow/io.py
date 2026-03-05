@@ -1,6 +1,7 @@
 import re
 from io import BytesIO
 from pathlib import Path
+from uuid import uuid4
 
 from docx import Document
 from pypdf import PdfReader
@@ -47,3 +48,19 @@ def write_resume_docx(content: str, output_path: Path) -> None:
         if clean:
             doc.add_paragraph(clean)
     doc.save(str(output_path))
+
+
+def read_docx_text(path: Path) -> str:
+    doc = Document(str(path))
+    paragraphs = [paragraph.text.strip() for paragraph in doc.paragraphs if paragraph.text.strip()]
+    return "\n".join(paragraphs)
+
+
+def persist_uploaded_resume(payload: bytes, filename: str, upload_dir: Path) -> Path:
+    upload_dir.mkdir(parents=True, exist_ok=True)
+    ext = Path(filename).suffix.lower() or ".docx"
+    stem = safe_stem(filename)
+    stored_name = f"{stem}-{uuid4().hex[:10]}{ext}"
+    path = upload_dir / stored_name
+    path.write_bytes(payload)
+    return path

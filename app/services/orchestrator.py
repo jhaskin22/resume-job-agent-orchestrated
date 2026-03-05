@@ -7,6 +7,7 @@ from app.core.config_loader import load_yaml
 from app.models.api import RunWorkflowResponse, WorkflowDiagnostics
 from app.models.tile import JobMatchTile
 from app.workflow.graph import build_workflow
+from app.workflow.io import persist_uploaded_resume
 from app.workflow.nodes import WorkflowNodes
 from app.workflow.state import WorkflowState
 
@@ -18,13 +19,20 @@ class ResumeJobOrchestrator:
 
         generated_resume_dir = settings.generated_resume_dir
         generated_resume_dir.mkdir(parents=True, exist_ok=True)
+        settings.uploaded_resume_dir.mkdir(parents=True, exist_ok=True)
 
         self._nodes = WorkflowNodes(workflow_config, prompts_config, generated_resume_dir)
         self._graph = build_workflow(self._nodes, workflow_config)
 
     def run(self, resume_filename: str, resume_file_bytes: bytes) -> RunWorkflowResponse:
+        uploaded_path = persist_uploaded_resume(
+            payload=resume_file_bytes,
+            filename=resume_filename,
+            upload_dir=settings.uploaded_resume_dir,
+        )
         initial_state: WorkflowState = {
             "resume_filename": resume_filename,
+            "uploaded_resume_path": str(uploaded_path),
             "resume_file_bytes": resume_file_bytes,
             "verification": {},
             "repair_counts": {},

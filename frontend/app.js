@@ -4,11 +4,19 @@ const statusEl = document.getElementById("status");
 const tilesEl = document.getElementById("tiles");
 const template = document.getElementById("tile-template");
 
-const backendBase = `${window.location.protocol}//${window.location.hostname}:18000`;
+const defaultBackendBase = `${window.location.protocol}//${window.location.hostname}:18000`;
+let activeBackendBase = "";
 
 function setStatus(message, isError = false) {
   statusEl.textContent = message;
   statusEl.style.color = isError ? "#8a1c1c" : "#244f31";
+}
+
+function normalizeBackendBase(candidate) {
+  if (candidate.startsWith("http")) {
+    return candidate.replace(/\/$/, "");
+  }
+  return `${window.location.origin}${candidate}`.replace(/\/$/, "");
 }
 
 function renderTiles(tiles) {
@@ -31,7 +39,14 @@ function renderTiles(tiles) {
     jobLink.href = tile.job_link;
 
     const resumeLink = clone.querySelector(".resume-link");
-    resumeLink.href = `${backendBase}${tile.generated_resume_link}`;
+    if (tile.generated_resume_link) {
+      const base = activeBackendBase || window.location.origin.replace(/\/$/, "");
+      resumeLink.href = `${base}${tile.generated_resume_link}`;
+      resumeLink.setAttribute("download", "");
+    } else {
+      resumeLink.removeAttribute("href");
+      resumeLink.textContent = "Resume unavailable";
+    }
 
     tilesEl.appendChild(clone);
   });
@@ -51,10 +66,7 @@ async function runWorkflow() {
   runButton.disabled = true;
 
   try {
-    const response = await fetch(`${backendBase}/api/workflow/run`, {
-      method: "POST",
-      body: form,
-    });
+    const response = await postWorkflowWithFallback(form);
 
     if (!response.ok) {
       const details = await response.json().catch(() => ({}));
@@ -68,12 +80,49 @@ async function runWorkflow() {
       .map(([stage, result]) => `${stage}:${result.ok ? "ok" : "failed"}`)
       .join(" | ");
 
-    setStatus(`Workflow completed. ${verificationSummary}`);
+    const state = payload.diagnostics?.failed ? "failed" : "completed";
+    setStatus(`Workflow ${state}. ${verificationSummary}`);
   } catch (error) {
-    setStatus(error.message || "Workflow failed.", true);
+    setStatus(error.message || "Workflow failed. Check backend URL and connectivity.", true);
   } finally {
     runButton.disabled = false;
   }
 }
 
 runButton.addEventListener("click", runWorkflow);
+
+function backendCandidates() {
+  const origin = window.location.origin.replace(/\/$/, "");
+  const path = window.location.pathname;
+  const proxyMarker = "/proxy/8090";
+  const prefix = path.includes(proxyMarker) ? path.split(proxyMarker)[0] : "";
+
+  const candidates = [
+    `${prefix}/proxy/18000`,
+    "/proxy/18000",
+    `${origin}${prefix}/proxy/18000`,
+    `${origin}/proxy/18000`,
+    defaultBackendBase,
+  ];
+  return [...new Set(candidates.map((value) => value.replace(/\/$/, "")))];
+}
+
+async function postWorkflowWithFallback(form) {
+  const candidates = backendCandidates();
+  for (const candidate of candidates) {
+    try {
+      const response = await fetch(`${candidate}/api/workflow/run`, {
+        method: "POST",
+        body: form,
+      });
+      if (response.ok || response.status >= 400) {
+        activeBackendBase = normalizeBackendBase(candidate);
+        return response;
+      }
+    } catch (_error) {
+      // Try next candidate.
+    }
+  }
+
+  throw new Error("Could not reach backend through proxy.");
+}

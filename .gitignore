@@ -8,3 +8,4 @@ htmlcov/
 .env
 .run/
 var/generated_resumes/
+var/uploads/

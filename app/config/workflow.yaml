@@ -4,23 +4,97 @@ workflow:
 nodes:
   resume_parsing:
     min_text_chars: 100
+    min_populated_fields: 2
   job_discovery:
     max_jobs: 8
+    min_job_count: 3
   job_scoring:
     min_match_score: 30
+    top_k: 6
   resume_generation:
-    min_resume_chars: 120
+    min_resume_bytes: 180
+  ats_evaluation: {}
   tile_construction:
     min_summary_chars: 30
 
+resume_parsing:
+  skill_keywords:
+    - python
+    - fastapi
+    - django
+    - flask
+    - sql
+    - postgres
+    - mysql
+    - kubernetes
+    - docker
+    - aws
+    - gcp
+    - azure
+    - langgraph
+    - machine-learning
+    - llm
+    - prompt-engineering
+    - airflow
+    - redis
+    - kafka
+  technology_keywords:
+    - python
+    - langgraph
+    - langchain
+    - fastapi
+    - react
+    - typescript
+    - docker
+    - kubernetes
+    - aws
+    - gcp
+    - terraform
+    - postgresql
+    - redis
+    - kafka
+    - pytorch
+    - scikit-learn
+  role_keywords:
+    - Software Engineer
+    - Platform Engineer
+    - Machine Learning Engineer
+    - Applied AI Engineer
+    - Backend Engineer
+    - Data Engineer
+    - Technical Lead
+
 job_discovery:
-  sample_jobs:
+  fetch_timeout_seconds: 1.0
+  companies:
+    - name: "GitLab"
+      careers_url: "https://about.gitlab.com/jobs/all-jobs/"
+      default_location: "Remote - US"
+      default_work_type: "remote"
+      job_link_keywords: ["job", "career", "positions", "gitlab.com/jobs"]
+    - name: "Automattic"
+      careers_url: "https://automattic.com/work-with-us/"
+      default_location: "Remote - US"
+      default_work_type: "remote"
+      job_link_keywords: ["job", "career", "work-with-us"]
+    - name: "Stripe"
+      careers_url: "https://stripe.com/jobs/search"
+      default_location: "United States"
+      default_work_type: "hybrid"
+      job_link_keywords: ["job", "career", "jobs/search"]
+    - name: "Cloudflare"
+      careers_url: "https://www.cloudflare.com/careers/jobs/"
+      default_location: "United States"
+      default_work_type: "hybrid"
+      job_link_keywords: ["job", "career", "greenhouse", "openings"]
+  fallback_jobs:
     - company: "Northwind Analytics"
       title: "Senior Python AI Engineer"
       location: "Remote - US"
       salary: "$145,000 - $170,000"
       work_type: "remote"
       job_link: "https://example.com/jobs/northwind-ai-engineer"
+      job_url: "https://example.com/jobs/northwind-ai-engineer"
       description: "Build multi-agent workflows, production Python APIs, and evaluation systems for LLM applications."
     - company: "Helios Health"
       title: "Applied AI Platform Engineer"
@@ -28,6 +102,7 @@ job_discovery:
       salary: "$155,000 - $185,000"
       work_type: "hybrid"
       job_link: "https://example.com/jobs/helios-platform"
+      job_url: "https://example.com/jobs/helios-platform"
       description: "Develop resilient orchestration for AI copilots, with strong testing and observability."
     - company: "Aster Retail"
       title: "LLM Product Engineer"
@@ -35,6 +110,7 @@ job_discovery:
       salary: "$135,000 - $160,000"
       work_type: "onsite"
       job_link: "https://example.com/jobs/aster-llm-product"
+      job_url: "https://example.com/jobs/aster-llm-product"
       description: "Ship user-facing AI features, improve ATS optimization workflows, and integrate retrieval pipelines."
     - company: "Blue Current Labs"
       title: "Agentic Workflow Developer"
@@ -42,4 +118,5 @@ job_discovery:
       salary: ""
       work_type: "hybrid"
       job_link: "https://example.com/jobs/blue-current-agentic"
+      job_url: "https://example.com/jobs/blue-current-agentic"
       description: "Design LangGraph state machines with verify-repair loops and configurable prompts."

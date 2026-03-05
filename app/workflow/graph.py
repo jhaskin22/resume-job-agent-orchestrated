@@ -48,6 +48,10 @@ def build_workflow(nodes: WorkflowNodes, workflow_config: dict[str, Any]):
     graph.add_node("verify_resume_generation", nodes.verify_resume_generation)
     graph.add_node("repair_resume_generation", nodes.repair_resume_generation)
 
+    graph.add_node("ats_evaluation", nodes.ats_evaluation)
+    graph.add_node("verify_ats_evaluation", nodes.verify_ats_evaluation)
+    graph.add_node("repair_ats_evaluation", nodes.repair_ats_evaluation)
+
     graph.add_node("tile_construction", nodes.tile_construction)
     graph.add_node("verify_tile_construction", nodes.verify_tile_construction)
     graph.add_node("repair_tile_construction", nodes.repair_tile_construction)
@@ -95,14 +99,26 @@ def build_workflow(nodes: WorkflowNodes, workflow_config: dict[str, Any]):
     graph.add_edge("resume_generation", "verify_resume_generation")
     graph.add_conditional_edges(
         "verify_resume_generation",
-        _verification_gate("resume_generation", max_repairs, "tile_construction"),
+        _verification_gate("resume_generation", max_repairs, "ats_evaluation"),
         {
-            "tile_construction": "tile_construction",
+            "ats_evaluation": "ats_evaluation",
             "repair_resume_generation": "repair_resume_generation",
             "mark_failed": "mark_failed",
         },
     )
     graph.add_edge("repair_resume_generation", "verify_resume_generation")
+
+    graph.add_edge("ats_evaluation", "verify_ats_evaluation")
+    graph.add_conditional_edges(
+        "verify_ats_evaluation",
+        _verification_gate("ats_evaluation", max_repairs, "tile_construction"),
+        {
+            "tile_construction": "tile_construction",
+            "repair_ats_evaluation": "repair_ats_evaluation",
+            "mark_failed": "mark_failed",
+        },
+    )
+    graph.add_edge("repair_ats_evaluation", "verify_ats_evaluation")
 
     graph.add_edge("tile_construction", "verify_tile_construction")
     graph.add_conditional_edges(

@@ -10,6 +10,7 @@ class Settings(BaseSettings):
     backend_port: int = 18000
     frontend_host: str = "0.0.0.0"
     frontend_port: int = 8090
+    uploaded_resume_dir: Path = Field(default_factory=lambda: Path("var/uploads"))
     generated_resume_dir: Path = Field(default_factory=lambda: Path("var/generated_resumes"))
     workflow_config_path: Path = Field(default_factory=lambda: Path("app/config/workflow.yaml"))
     prompts_config_path: Path = Field(default_factory=lambda: Path("app/config/prompts.yaml"))

@@ -1,9 +1,11 @@
 from io import BytesIO
+from pathlib import Path
 
 import pytest
 from docx import Document
 from httpx import ASGITransport, AsyncClient
 
+from app.core.config import settings
 from app.main import app
 
 
@@ -23,6 +25,9 @@ def _build_docx_payload() -> bytes:
 
 @pytest.mark.anyio
 async def test_run_workflow_with_docx() -> None:
+    upload_dir = Path(settings.uploaded_resume_dir)
+    before_uploads = {path.name for path in upload_dir.glob("*")} if upload_dir.exists() else set()
+
     transport = ASGITransport(app=app)
     async with AsyncClient(transport=transport, base_url="http://test") as client:
         response = await client.post(
@@ -39,7 +44,38 @@ async def test_run_workflow_with_docx() -> None:
     assert response.status_code == 200
     payload = response.json()
     assert payload["tiles"]
+    assert payload["diagnostics"]["verification"]["ats_evaluation"]["ok"] is True
     first = payload["tiles"][0]
     assert first["company"]
     assert first["generated_resume_link"].startswith("/api/resumes/")
     assert "verification" in payload["diagnostics"]
+
+    after_uploads = {path.name for path in upload_dir.glob("*")} if upload_dir.exists() else set()
+    assert len(after_uploads - before_uploads) >= 1
+
+
+@pytest.mark.anyio
+async def test_generated_resume_download() -> None:
+    transport = ASGITransport(app=app)
+    async with AsyncClient(transport=transport, base_url="http://test") as client:
+        run_response = await client.post(
+            "/api/workflow/run",
+            files={
+                "resume": (
+                    "candidate.docx",
+                    _build_docx_payload(),
+                    "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+                )
+            },
+        )
+        assert run_response.status_code == 200
+        payload = run_response.json()
+        link = payload["tiles"][0]["generated_resume_link"]
+
+        download_response = await client.get(link)
+
+    assert download_response.status_code == 200
+    assert download_response.headers["content-type"].startswith(
+        "application/vnd.openxmlformats-officedocument.wordprocessingml.document"
+    )
+    assert len(download_response.content) > 100
