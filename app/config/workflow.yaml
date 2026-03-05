@@ -1,0 +1,45 @@
+workflow:
+  max_repair_attempts: 2
+
+nodes:
+  resume_parsing:
+    min_text_chars: 100
+  job_discovery:
+    max_jobs: 8
+  job_scoring:
+    min_match_score: 30
+  resume_generation:
+    min_resume_chars: 120
+  tile_construction:
+    min_summary_chars: 30
+
+job_discovery:
+  sample_jobs:
+    - company: "Northwind Analytics"
+      title: "Senior Python AI Engineer"
+      location: "Remote - US"
+      salary: "$145,000 - $170,000"
+      work_type: "remote"
+      job_link: "https://example.com/jobs/northwind-ai-engineer"
+      description: "Build multi-agent workflows, production Python APIs, and evaluation systems for LLM applications."
+    - company: "Helios Health"
+      title: "Applied AI Platform Engineer"
+      location: "Boston, MA"
+      salary: "$155,000 - $185,000"
+      work_type: "hybrid"
+      job_link: "https://example.com/jobs/helios-platform"
+      description: "Develop resilient orchestration for AI copilots, with strong testing and observability."
+    - company: "Aster Retail"
+      title: "LLM Product Engineer"
+      location: "Austin, TX"
+      salary: "$135,000 - $160,000"
+      work_type: "onsite"
+      job_link: "https://example.com/jobs/aster-llm-product"
+      description: "Ship user-facing AI features, improve ATS optimization workflows, and integrate retrieval pipelines."
+    - company: "Blue Current Labs"
+      title: "Agentic Workflow Developer"
+      location: "Seattle, WA"
+      salary: ""
+      work_type: "hybrid"
+      job_link: "https://example.com/jobs/blue-current-agentic"
+      description: "Design LangGraph state machines with verify-repair loops and configurable prompts."

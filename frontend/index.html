@@ -1,0 +1,45 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>Resume Job Agent Orchestrated</title>
+    <link rel="stylesheet" href="styles.css" />
+  </head>
+  <body>
+    <main class="page">
+      <header class="hero">
+        <h1>Resume Job Agent Orchestrated</h1>
+        <p>Upload a resume, run LangGraph orchestration, review ranked jobs, and download tailored DOCX resumes.</p>
+      </header>
+
+      <section class="controls">
+        <label for="resume">Resume (PDF or DOCX)</label>
+        <input id="resume" type="file" accept=".pdf,.docx" />
+        <button id="run">Discover Jobs</button>
+        <p id="status" class="status"></p>
+      </section>
+
+      <section>
+        <h2>Ranked Job Matches</h2>
+        <div id="tiles" class="tiles"></div>
+      </section>
+    </main>
+
+    <template id="tile-template">
+      <article class="tile">
+        <h3 class="title"></h3>
+        <p class="company"></p>
+        <p class="meta"></p>
+        <p class="scores"></p>
+        <p class="summary"></p>
+        <div class="links">
+          <a class="job-link" target="_blank" rel="noreferrer">Job Posting</a>
+          <a class="resume-link" target="_blank" rel="noreferrer">Generated Resume</a>
+        </div>
+      </article>
+    </template>
+
+    <script src="app.js"></script>
+  </body>
+</html>

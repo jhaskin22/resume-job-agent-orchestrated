@@ -1,0 +1,83 @@
+:root {
+  --bg: #f4f7f8;
+  --ink: #13262f;
+  --accent: #1f6f78;
+  --tile: #ffffff;
+  --border: #c8d8db;
+}
+
+* {
+  box-sizing: border-box;
+}
+
+body {
+  margin: 0;
+  background: radial-gradient(circle at top right, #dbeef2, var(--bg));
+  color: var(--ink);
+  font-family: "IBM Plex Sans", "Segoe UI", sans-serif;
+}
+
+.page {
+  width: min(1100px, 100% - 2rem);
+  margin: 2rem auto 4rem;
+}
+
+.hero h1 {
+  margin: 0;
+  font-size: clamp(1.8rem, 3vw, 2.8rem);
+}
+
+.controls {
+  background: #e7f2f4;
+  border: 1px solid var(--border);
+  border-radius: 10px;
+  padding: 1rem;
+  margin: 1.5rem 0;
+  display: grid;
+  gap: 0.75rem;
+}
+
+button {
+  width: fit-content;
+  background: var(--accent);
+  color: #fff;
+  border: none;
+  border-radius: 8px;
+  padding: 0.6rem 1rem;
+  cursor: pointer;
+}
+
+button:disabled {
+  opacity: 0.7;
+  cursor: wait;
+}
+
+.tiles {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(280px, 1fr));
+  gap: 1rem;
+}
+
+.tile {
+  background: var(--tile);
+  border: 1px solid var(--border);
+  border-radius: 10px;
+  padding: 1rem;
+  box-shadow: 0 5px 18px rgba(19, 38, 47, 0.08);
+}
+
+.tile .title {
+  margin: 0;
+}
+
+.links {
+  display: flex;
+  gap: 0.85rem;
+  margin-top: 1rem;
+}
+
+a {
+  color: var(--accent);
+  text-decoration: none;
+  font-weight: 600;
+}

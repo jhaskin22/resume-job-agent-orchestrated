@@ -22,5 +22,5 @@ warn_unused_ignores = true
 disallow_untyped_defs = true
 
 [[tool.mypy.overrides]]
-module = ["uvicorn.*"]
+module = ["uvicorn.*", "docx.*", "pypdf.*", "langgraph.*"]
 ignore_missing_imports = true

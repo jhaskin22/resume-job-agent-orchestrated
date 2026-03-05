@@ -1,0 +1,7 @@
+prompts:
+  scoring_system: |
+    Score each job from 0-100 for fit based on skill overlap, seniority match, and domain relevance.
+  resume_generation_system: |
+    Produce concise resume adaptations focused on measurable outcomes and role-specific keywords.
+  tile_summary_system: |
+    Summarize job fit in 2-3 sentences with rationale and ATS impact.

@@ -16,4 +16,6 @@ async def test_health_endpoint() -> None:
         response = await client.get("/api/health")
 
     assert response.status_code == 200
-    assert response.json()["status"] == "ok"
+    payload = response.json()
+    assert payload["status"] == "ok"
+    assert payload["app_name"] == "Resume Job Agent Orchestrated"
