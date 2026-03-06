@@ -14,6 +14,58 @@ nodes:
     min_match_score: 0
     top_k: 0
     max_per_company: 0
+    career_path:
+      target_titles:
+        - Senior Software Engineer
+        - Backend Engineer
+        - Platform Engineer
+        - Infrastructure Engineer
+        - Distributed Systems Engineer
+        - Cloud Engineer
+        - Systems Software Engineer
+      responsibility_focus:
+        - backend systems
+        - backend services
+        - distributed systems
+        - cloud platforms
+        - api
+        - microservices
+      must_have_keywords:
+        - java
+        - python
+        - go
+        - backend services
+        - distributed systems
+        - api
+        - microservices
+        - sql
+        - data systems
+        - git
+      nice_to_have_keywords:
+        - aws
+        - docker
+        - kubernetes
+        - infrastructure
+        - platform engineering
+        - devops
+        - ci/cd
+        - reliability engineering
+        - large-scale systems
+      allow_management_roles: false
+      allowed_levels: ["mid", "senior"]
+      discouraged_levels: ["staff", "principal", "director", "senior_manager"]
+      strong_match_override: 82
+      min_career_fit: 12
+      salary:
+        minimum: 110000
+        target_min: 130000
+        target_max: 180000
+        prefer_disclosed_tiebreaker: true
+      weights:
+        resume_fit: 0.42
+        career_fit: 0.28
+        must_have_fit: 0.18
+        nice_to_have_fit: 0.12
   resume_generation:
     min_resume_bytes: 180
     max_bullet_rewrites: 2

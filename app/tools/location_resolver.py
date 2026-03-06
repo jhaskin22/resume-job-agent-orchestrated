@@ -64,6 +64,8 @@ class LocationResolver:
             for item in self.preferences.get("allowed_work_types", ["remote", "hybrid"])
         }
         work_type = str(job.get("work_type", "")).strip().lower()
+        if work_type and work_type not in allowed_work_types:
+            return False
         if work_type == "remote":
             return "remote" in allowed_work_types and self._is_north_america_remote(job)
         if work_type == "hybrid" and "hybrid" not in allowed_work_types:

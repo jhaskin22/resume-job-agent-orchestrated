@@ -210,6 +210,7 @@ class WorkflowRunManager:
             discovered_jobs,
             parsed_jobs=parsed_map,
             top_k=0 if top_k <= 0 else max(top_k, len(discovered_jobs)),
+            scoring_config=workflow_config["nodes"]["job_scoring"],
         )
         scored = [job for job in scored if float(job.get("match_score", 0)) >= min_score]
 

@@ -468,6 +468,7 @@ class WorkflowNodes:
             discovered_jobs,
             parsed_jobs=parsed_jobs_map,
             top_k=scoring_top_k,
+            scoring_config=self.workflow_config["nodes"]["job_scoring"],
         )
         scored = [item for item in scored if float(item.get("match_score", 0.0)) >= min_score]
         scored = self._diversify_companies(scored)

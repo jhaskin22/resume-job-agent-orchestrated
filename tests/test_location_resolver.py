@@ -18,7 +18,7 @@ def _resolver() -> LocationResolver:
     )
 
 
-def test_dfw_alias_normalization_match() -> None:
+def test_dfw_onsite_reject_when_onsite_not_allowed() -> None:
     resolver = _resolver()
     job = {
         "work_type": "onsite",
@@ -26,7 +26,7 @@ def test_dfw_alias_normalization_match() -> None:
         "title": "Software Engineer",
         "job_url": "https://jobs.example.com/123",
     }
-    assert resolver.matches_preference(job) is True
+    assert resolver.matches_preference(job) is False
 
 
 def test_remote_unknown_region_reject() -> None:
