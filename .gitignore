@@ -9,3 +9,4 @@ htmlcov/
 .run/
 var/generated_resumes/
 var/uploads/
+var/discovery_cache.json
