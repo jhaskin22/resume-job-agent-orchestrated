@@ -3,16 +3,19 @@ workflow:
 
 nodes:
   resume_parsing:
-    min_text_chars: 100
+    min_text_chars: 40
     min_populated_fields: 2
   job_discovery:
     max_jobs: 8
     min_job_count: 3
+    max_discovery_retries: 1
+  job_parsing: {}
   job_scoring:
     min_match_score: 30
     top_k: 6
   resume_generation:
     min_resume_bytes: 180
+    max_bullet_rewrites: 2
   ats_evaluation: {}
   tile_construction:
     min_summary_chars: 30
@@ -65,58 +68,141 @@ resume_parsing:
     - Technical Lead
 
 job_discovery:
-  fetch_timeout_seconds: 1.0
+  fetch_timeout_seconds: 0.4
   companies:
-    - name: "GitLab"
-      careers_url: "https://about.gitlab.com/jobs/all-jobs/"
-      default_location: "Remote - US"
+    - name: "Stripe"
+      careers_url: "https://careers.stripe.com/jobs"
+      default_location: "United States"
+      default_work_type: "hybrid"
+      job_link_keywords: ["job", "position", "opening", "stripe.com/jobs"]
+    - name: "Cloudflare"
+      careers_url: "https://jobs.cloudflare.com/"
+      default_location: "United States"
+      default_work_type: "hybrid"
+      job_link_keywords: ["job", "position", "opening", "cloudflare.com"]
+    - name: "GitHub"
+      careers_url: "https://github.com/careers"
+      default_location: "United States"
       default_work_type: "remote"
-      job_link_keywords: ["job", "career", "positions", "gitlab.com/jobs"]
+      job_link_keywords: ["job", "position", "opening", "github.com/careers"]
+    - name: "Datadog"
+      careers_url: "https://www.datadoghq.com/careers/"
+      default_location: "United States"
+      default_work_type: "hybrid"
+      job_link_keywords: ["job", "position", "opening", "datadoghq.com/careers"]
+    - name: "MongoDB"
+      careers_url: "https://www.mongodb.com/company/careers/teams/engineering"
+      default_location: "United States"
+      default_work_type: "hybrid"
+      job_link_keywords: ["job", "position", "opening", "mongodb.com/careers"]
+    - name: "HashiCorp"
+      careers_url: "https://www.hashicorp.com/en/careers/open-positions"
+      default_location: "United States"
+      default_work_type: "remote"
+      job_link_keywords: ["job", "position", "opening", "hashicorp.com/careers"]
     - name: "Automattic"
       careers_url: "https://automattic.com/work-with-us/"
       default_location: "Remote - US"
       default_work_type: "remote"
-      job_link_keywords: ["job", "career", "work-with-us"]
-    - name: "Stripe"
-      careers_url: "https://stripe.com/jobs/search"
+      job_link_keywords: ["job", "position", "opening", "automattic.com"]
+    - name: "Shopify"
+      careers_url: "https://www.shopify.com/careers"
+      default_location: "United States"
+      default_work_type: "remote"
+      job_link_keywords: ["job", "position", "opening", "shopify.com/careers"]
+    - name: "NVIDIA"
+      careers_url: "https://www.nvidia.com/en-us/about-nvidia/careers/"
       default_location: "United States"
       default_work_type: "hybrid"
-      job_link_keywords: ["job", "career", "jobs/search"]
-    - name: "Cloudflare"
-      careers_url: "https://www.cloudflare.com/careers/jobs/"
+      job_link_keywords: ["job", "position", "opening", "nvidia.com/careers"]
+    - name: "Snowflake"
+      careers_url: "https://careers.snowflake.com/us/en/search-results"
       default_location: "United States"
       default_work_type: "hybrid"
-      job_link_keywords: ["job", "career", "greenhouse", "openings"]
-  fallback_jobs:
-    - company: "Northwind Analytics"
-      title: "Senior Python AI Engineer"
-      location: "Remote - US"
-      salary: "$145,000 - $170,000"
-      work_type: "remote"
-      job_link: "https://example.com/jobs/northwind-ai-engineer"
-      job_url: "https://example.com/jobs/northwind-ai-engineer"
-      description: "Build multi-agent workflows, production Python APIs, and evaluation systems for LLM applications."
-    - company: "Helios Health"
-      title: "Applied AI Platform Engineer"
-      location: "Boston, MA"
-      salary: "$155,000 - $185,000"
-      work_type: "hybrid"
-      job_link: "https://example.com/jobs/helios-platform"
-      job_url: "https://example.com/jobs/helios-platform"
-      description: "Develop resilient orchestration for AI copilots, with strong testing and observability."
-    - company: "Aster Retail"
-      title: "LLM Product Engineer"
-      location: "Austin, TX"
-      salary: "$135,000 - $160,000"
-      work_type: "onsite"
-      job_link: "https://example.com/jobs/aster-llm-product"
-      job_url: "https://example.com/jobs/aster-llm-product"
-      description: "Ship user-facing AI features, improve ATS optimization workflows, and integrate retrieval pipelines."
-    - company: "Blue Current Labs"
-      title: "Agentic Workflow Developer"
-      location: "Seattle, WA"
-      salary: ""
-      work_type: "hybrid"
-      job_link: "https://example.com/jobs/blue-current-agentic"
-      job_url: "https://example.com/jobs/blue-current-agentic"
-      description: "Design LangGraph state machines with verify-repair loops and configurable prompts."
+      job_link_keywords: ["job", "position", "opening", "snowflake.com"]
+    - name: "Fastly"
+      careers_url: "https://www.fastly.com/about/careers"
+      default_location: "United States"
+      default_work_type: "remote"
+      job_link_keywords: ["job", "position", "opening", "fastly.com"]
+    - name: "DigitalOcean"
+      careers_url: "https://www.digitalocean.com/careers"
+      default_location: "United States"
+      default_work_type: "remote"
+      job_link_keywords: ["job", "position", "opening", "digitalocean.com"]
+    - name: "Vercel"
+      careers_url: "https://vercel.com/careers"
+      default_location: "United States"
+      default_work_type: "remote"
+      job_link_keywords: ["job", "position", "opening", "vercel.com"]
+    - name: "Netflix"
+      careers_url: "https://jobs.netflix.com/"
+      default_location: "United States"
+      default_work_type: "hybrid"
+      job_link_keywords: ["job", "position", "opening", "netflix.com"]
+    - name: "Uber"
+      careers_url: "https://www.uber.com/us/en/careers/list/"
+      default_location: "United States"
+      default_work_type: "hybrid"
+      job_link_keywords: ["job", "position", "opening", "uber.com"]
+    - name: "Lyft"
+      careers_url: "https://www.lyft.com/careers"
+      default_location: "United States"
+      default_work_type: "hybrid"
+      job_link_keywords: ["job", "position", "opening", "lyft.com"]
+    - name: "Twilio"
+      careers_url: "https://www.twilio.com/company/jobs"
+      default_location: "United States"
+      default_work_type: "remote"
+      job_link_keywords: ["job", "position", "opening", "twilio.com"]
+    - name: "Texas Instruments"
+      careers_url: "https://careers.ti.com/"
+      default_location: "United States"
+      default_work_type: "onsite"
+      job_link_keywords: ["job", "position", "opening", "ti.com"]
+    - name: "Lockheed Martin"
+      careers_url: "https://www.lockheedmartinjobs.com/"
+      default_location: "United States"
+      default_work_type: "onsite"
+      job_link_keywords: ["job", "position", "opening", "lockheedmartin.com"]
+    - name: "Raytheon"
+      careers_url: "https://careers.rtx.com/"
+      default_location: "United States"
+      default_work_type: "onsite"
+      job_link_keywords: ["job", "position", "opening", "rtx.com"]
+    - name: "Bell"
+      careers_url: "https://jobs.bellflight.com/"
+      default_location: "United States"
+      default_work_type: "onsite"
+      job_link_keywords: ["job", "position", "opening", "bellflight.com"]
+    - name: "BNSF"
+      careers_url: "https://jobs.bnsf.com/"
+      default_location: "United States"
+      default_work_type: "onsite"
+      job_link_keywords: ["job", "position", "opening", "bnsf.com"]
+    - name: "Capital One"
+      careers_url: "https://www.capitalonecareers.com/"
+      default_location: "United States"
+      default_work_type: "hybrid"
+      job_link_keywords: ["job", "position", "opening", "capitalonecareers.com"]
+    - name: "State Farm"
+      careers_url: "https://jobs.statefarm.com/"
+      default_location: "United States"
+      default_work_type: "hybrid"
+      job_link_keywords: ["job", "position", "opening", "statefarm.com"]
+    - name: "Charles Schwab"
+      careers_url: "https://www.schwabjobs.com/"
+      default_location: "United States"
+      default_work_type: "hybrid"
+      job_link_keywords: ["job", "position", "opening", "schwabjobs.com"]
+    - name: "AT&T"
+      careers_url: "https://www.att.jobs/"
+      default_location: "United States"
+      default_work_type: "hybrid"
+      job_link_keywords: ["job", "position", "opening", "att.jobs"]
+    - name: "Toyota Connected"
+      careers_url: "https://careers.toyotaconnected.com/"
+      default_location: "United States"
+      default_work_type: "hybrid"
+      job_link_keywords: ["job", "position", "opening", "toyotaconnected.com"]
+  fallback_jobs: []

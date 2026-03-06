@@ -40,6 +40,10 @@ def build_workflow(nodes: WorkflowNodes, workflow_config: dict[str, Any]):
     graph.add_node("verify_job_discovery", nodes.verify_job_discovery)
     graph.add_node("repair_job_discovery", nodes.repair_job_discovery)
 
+    graph.add_node("job_parsing", nodes.job_parsing)
+    graph.add_node("verify_job_parsing", nodes.verify_job_parsing)
+    graph.add_node("repair_job_parsing", nodes.repair_job_parsing)
+
     graph.add_node("job_scoring", nodes.job_scoring)
     graph.add_node("verify_job_scoring", nodes.verify_job_scoring)
     graph.add_node("repair_job_scoring", nodes.repair_job_scoring)
@@ -75,14 +79,26 @@ def build_workflow(nodes: WorkflowNodes, workflow_config: dict[str, Any]):
     graph.add_edge("job_discovery", "verify_job_discovery")
     graph.add_conditional_edges(
         "verify_job_discovery",
-        _verification_gate("job_discovery", max_repairs, "job_scoring"),
+        _verification_gate("job_discovery", max_repairs, "job_parsing"),
         {
-            "job_scoring": "job_scoring",
+            "job_parsing": "job_parsing",
             "repair_job_discovery": "repair_job_discovery",
             "mark_failed": "mark_failed",
         },
     )
     graph.add_edge("repair_job_discovery", "verify_job_discovery")
+
+    graph.add_edge("job_parsing", "verify_job_parsing")
+    graph.add_conditional_edges(
+        "verify_job_parsing",
+        _verification_gate("job_parsing", max_repairs, "job_scoring"),
+        {
+            "job_scoring": "job_scoring",
+            "repair_job_parsing": "repair_job_parsing",
+            "mark_failed": "mark_failed",
+        },
+    )
+    graph.add_edge("repair_job_parsing", "verify_job_parsing")
 
     graph.add_edge("job_scoring", "verify_job_scoring")
     graph.add_conditional_edges(

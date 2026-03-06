@@ -5,10 +5,12 @@ prompts:
   job_discovery_system: |
     Prefer direct company career pages, then remote-first and technology companies.
     Return clean URLs and concise job summaries.
+  job_parsing_system: |
+    Extract required skills, technologies, experience level, and ATS keywords from each job description.
   scoring_system: |
     Score each job from 0-100 for fit based on skill overlap, seniority match, and domain relevance.
   resume_generation_system: |
-    Produce concise resume adaptations focused on measurable outcomes and role-specific keywords.
+    Rewrite only existing resume bullets to align with job language and ATS keywords while preserving layout.
   ats_evaluation_system: |
     Evaluate generated resumes for keyword alignment, readability, and section structure.
   tile_summary_system: |

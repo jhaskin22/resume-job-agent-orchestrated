@@ -7,7 +7,12 @@ from typing import Any
 from app.tools.resume import tokenize
 
 
-def evaluate_ats_score(job: dict[str, Any], resume_text: str) -> float:
+def evaluate_ats_score(
+    job: dict[str, Any],
+    resume_text: str,
+    parsed_job: dict[str, Any] | None = None,
+) -> tuple[float, dict[str, float]]:
+    parsed_job = parsed_job or {}
     job_tokens = tokenize(f"{job.get('title', '')} {job.get('description', '')}")
     resume_tokens = tokenize(resume_text)
 
@@ -16,11 +21,42 @@ def evaluate_ats_score(job: dict[str, Any], resume_text: str) -> float:
     else:
         keyword_alignment = 0.0
 
+    required_tech = {str(item).lower() for item in parsed_job.get("technologies", [])}
+    if required_tech:
+        tech_coverage = len(required_tech.intersection(resume_tokens)) / len(required_tech)
+    else:
+        tech_coverage = 0.5
+
+    required_keywords = {str(item).lower() for item in parsed_job.get("ats_keywords", [])}
+    if required_keywords:
+        keyword_coverage = len(required_keywords.intersection(resume_tokens)) / len(
+            required_keywords
+        )
+    else:
+        keyword_coverage = keyword_alignment
+
     readability = _readability_score(resume_text)
+    clarity = _clarity_score(resume_text)
     structure = _section_structure_score(resume_text)
 
-    total = (keyword_alignment * 55) + (readability * 25) + (structure * 20)
-    return round(max(0.0, min(100.0, total)), 2)
+    total = (
+        (keyword_alignment * 30)
+        + (keyword_coverage * 20)
+        + (tech_coverage * 15)
+        + (readability * 15)
+        + (clarity * 10)
+        + (structure * 10)
+    )
+    score = round(max(0.0, min(100.0, total)), 2)
+    factors = {
+        "keyword_alignment": round(keyword_alignment * 100, 2),
+        "keyword_coverage": round(keyword_coverage * 100, 2),
+        "tech_coverage": round(tech_coverage * 100, 2),
+        "readability": round(readability * 100, 2),
+        "clarity": round(clarity * 100, 2),
+        "structure": round(structure * 100, 2),
+    }
+    return (score, factors)
 
 
 def _readability_score(text: str) -> float:
@@ -51,3 +87,18 @@ def _section_structure_score(text: str) -> float:
     ]
     return mean(1.0 if item else 0.0 for item in section_hits)
 
+
+def _clarity_score(text: str) -> float:
+    lines = [line.strip() for line in text.splitlines() if line.strip()]
+    bullet_like = [line for line in lines if line.startswith(("-", "•", "*"))]
+    if not lines:
+        return 0.0
+    if not bullet_like:
+        return 0.5
+
+    concise = 0
+    for line in bullet_like:
+        words = len(re.findall(r"[A-Za-z0-9+#.-]+", line))
+        if 8 <= words <= 32:
+            concise += 1
+    return concise / max(1, len(bullet_like))
