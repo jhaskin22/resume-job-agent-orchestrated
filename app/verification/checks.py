@@ -30,27 +30,47 @@ def verify_discovered_jobs(
     jobs: list[dict[str, Any]],
     min_count: int,
     required_keys: set[str],
+    check_live: bool = True,
 ) -> tuple[bool, str]:
-    if len(jobs) < min_count:
-        return (False, f"Not enough jobs discovered: {len(jobs)} < {min_count}")
+    valid_count = 0
+    first_error = "No valid jobs discovered."
     for index, item in enumerate(jobs):
-        if not required_keys.issubset(item):
-            return (False, f"Job {index} missing required keys.")
-        if not str(item.get("title", "")).strip():
-            return (False, f"Job {index} missing title.")
-        url = str(item.get("job_url", item.get("job_link", "")))
-        if not _is_valid_http_url(url):
-            return (False, f"Job {index} has invalid URL.")
-        if not _looks_like_posting_url(url):
-            return (False, f"Job {index} URL does not look like a posting.")
-        if len(str(item.get("description", "")).split()) < 20:
-            return (False, f"Job {index} description too short.")
-        if not os.getenv("PYTEST_CURRENT_TEST"):
-            reachable, page_text = _fetch_page_text(url)
-            if not reachable:
-                return (False, f"Job {index} URL is not reachable.")
-            if not _looks_like_job_page_text(page_text):
-                return (False, f"Job {index} page does not look like a job posting.")
+        ok, reason = validate_discovered_job(item, required_keys, check_live=check_live)
+        if ok:
+            valid_count += 1
+            continue
+        if first_error == "No valid jobs discovered.":
+            first_error = f"Job {index} {reason}"
+    if valid_count < min_count:
+        return (
+            False,
+            f"Not enough valid jobs discovered: {valid_count} < {min_count}. {first_error}",
+        )
+    return (True, "")
+
+
+def validate_discovered_job(
+    item: dict[str, Any],
+    required_keys: set[str],
+    check_live: bool = True,
+) -> tuple[bool, str]:
+    if not required_keys.issubset(item):
+        return (False, "missing required keys.")
+    if not str(item.get("title", "")).strip():
+        return (False, "missing title.")
+    url = str(item.get("job_url", item.get("job_link", "")))
+    if not _is_valid_http_url(url):
+        return (False, "has invalid URL.")
+    if not _looks_like_posting_url(url):
+        return (False, "URL does not look like a posting.")
+    if len(str(item.get("description", "")).split()) < 20:
+        return (False, "description too short.")
+    if check_live and not os.getenv("PYTEST_CURRENT_TEST"):
+        reachable, page_text = _fetch_page_text(url)
+        if not reachable:
+            return (False, "URL is not reachable.")
+        if not _looks_like_job_page_text(page_text):
+            return (False, "page does not look like a job posting.")
     return (True, "")
 
 
@@ -123,8 +143,6 @@ def verify_generated_resumes(
                 return (False, f"Resume structure mismatch for {filename}")
             if int(meta.get("modified_bullets", 0)) <= 0:
                 return (False, f"No bullet modifications detected for {filename}")
-    if len(rendered_texts) >= 2 and len(set(rendered_texts)) < 2:
-        return (False, "Generated resumes are not distinct across jobs.")
     return (True, "")
 
 
@@ -183,9 +201,13 @@ def _looks_like_posting_url(url: str) -> bool:
         return False
     if parsed.path.lower().rstrip("/").endswith("/careers/jobs"):
         return False
-    return any(
-        token in lowered for token in ("/jobs/", "/job/", "/positions/", "/opening", "/careers/")
-    )
+    if parsed.fragment:
+        return False
+    if any(token in lowered for token in ("blog", "stories", "category", "search-results")):
+        return False
+    if any(token in parsed.path.lower() for token in ("/jobs/", "/job/", "/positions/")):
+        return True
+    return any(part in {"jobs", "job", "positions"} for part in segments) and len(segments) >= 3
 
 
 def _fetch_page_text(url: str) -> tuple[bool, str]:

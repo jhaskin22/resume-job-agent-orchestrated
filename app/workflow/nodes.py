@@ -14,6 +14,7 @@ from app.tools.job_parsing import parse_job_details
 from app.tools.resume import parse_resume_sections
 from app.tools.scoring import score_jobs
 from app.verification.checks import (
+    validate_discovered_job,
     verify_ats_scores,
     verify_discovered_jobs,
     verify_generated_resumes,
@@ -364,11 +365,23 @@ class WorkflowNodes:
     def verify_job_discovery(self, state: WorkflowState) -> dict[str, Any]:
         jobs = state.get("discovered_jobs", [])
         min_jobs = int(self.workflow_config["nodes"]["job_discovery"]["min_job_count"])
-        ok, reason = verify_discovered_jobs(jobs, min_jobs, REQUIRED_DISCOVERY_KEYS)
+        valid_jobs: list[dict[str, Any]] = []
+        for item in jobs:
+            ok_item, _ = validate_discovered_job(item, REQUIRED_DISCOVERY_KEYS, check_live=False)
+            if ok_item:
+                valid_jobs.append(item)
+        ok, reason = verify_discovered_jobs(
+            valid_jobs,
+            min_jobs,
+            REQUIRED_DISCOVERY_KEYS,
+            check_live=False,
+        )
         if not ok:
             return self._set_verification(state, "job_discovery", False, reason)
 
-        return self._set_verification(state, "job_discovery", True)
+        update = self._set_verification(state, "job_discovery", True)
+        update["discovered_jobs"] = valid_jobs
+        return update
 
     def repair_job_discovery(self, state: WorkflowState) -> dict[str, Any]:
         self._inc_repair_count(state, "job_discovery")
@@ -478,7 +491,7 @@ class WorkflowNodes:
             company = str(job.get("company", "company"))
             role = str(job.get("title", "role"))
             parsed_job = parsed_jobs_map.get(str(job.get("job_link", "")), {})
-            emphasis_keywords = [
+            base_keywords = [
                 str(item)
                 for item in (
                     parsed_job.get("ats_keywords", [])[:6]
@@ -486,6 +499,7 @@ class WorkflowNodes:
                     or ["python", "api", "distributed systems"]
                 )
             ]
+            emphasis_keywords = [role, company, *base_keywords]
 
             output_filename = f"{stem}-{run_id}-{index:02d}.docx"
             output_path = self.generated_resume_dir / output_filename

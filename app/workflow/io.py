@@ -79,10 +79,11 @@ def rewrite_resume_docx(
 
     original_paragraphs = len(doc.paragraphs)
     bullet_indexes = _bullet_paragraph_indexes(doc)
+    rewrite_indexes = bullet_indexes or _experience_paragraph_indexes(doc)
     modified_bullets = 0
 
-    for bullet_index in bullet_indexes[: min(max_rewrites, 2)]:
-        paragraph = doc.paragraphs[bullet_index]
+    for paragraph_index in rewrite_indexes[: min(max_rewrites, 2)]:
+        paragraph = doc.paragraphs[paragraph_index]
         original_text = paragraph.text
         rewritten = _rewrite_bullet_text(original_text, emphasis_keywords, modified_bullets)
         if rewritten != original_text:
@@ -94,7 +95,7 @@ def rewrite_resume_docx(
     logger.info(
         "resume_rewrite paragraphs=%s bullets=%s modified=%s keywords=%s",
         original_paragraphs,
-        len(bullet_indexes),
+        len(rewrite_indexes),
         modified_bullets,
         len(emphasis_keywords),
     )
@@ -102,7 +103,7 @@ def rewrite_resume_docx(
     return {
         "original_paragraphs": original_paragraphs,
         "output_paragraphs": len(doc.paragraphs),
-        "bullet_count": len(bullet_indexes),
+        "bullet_count": len(rewrite_indexes),
         "modified_bullets": modified_bullets,
     }
 
@@ -119,6 +120,20 @@ def _bullet_paragraph_indexes(doc: Document) -> list[int]:
             or text.startswith(("-", "•", "*"))
             or text[:2].isdigit() and text[1:2] == "."
         ):
+            indexes.append(idx)
+    return indexes
+
+
+def _experience_paragraph_indexes(doc: Document) -> list[int]:
+    indexes: list[int] = []
+    for idx, paragraph in enumerate(doc.paragraphs):
+        text = paragraph.text.strip()
+        if len(text.split()) < 5:
+            continue
+        lowered = text.lower()
+        if re.search(r"\b(summary|experience|skills|education|projects)\b", lowered):
+            continue
+        if re.search(r"\b(led|built|developed|designed|managed|improved|implemented)\b", lowered):
             indexes.append(idx)
     return indexes
 
@@ -183,4 +198,18 @@ def _apply_keyword_context(sentence: str, keyword: str) -> str:
     for pattern, replacement in patterns:
         if re.search(pattern, sentence, flags=re.IGNORECASE):
             return re.sub(pattern, replacement, sentence, count=1, flags=re.IGNORECASE)
-    return sentence
+    verb_match = re.match(
+        r"^(Built|Developed|Designed|Managed|Led|Improved|Implemented)\b",
+        sentence,
+        flags=re.IGNORECASE,
+    )
+    if verb_match:
+        verb = verb_match.group(1)
+        return re.sub(
+            r"^(Built|Developed|Designed|Managed|Led|Improved|Implemented)\b",
+            f"{verb} scalable {keyword}",
+            sentence,
+            count=1,
+            flags=re.IGNORECASE,
+        )
+    return f"{keyword} {sentence}".strip()

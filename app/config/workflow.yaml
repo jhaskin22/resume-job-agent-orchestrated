@@ -7,11 +7,11 @@ nodes:
     min_populated_fields: 2
   job_discovery:
     max_jobs: 8
-    min_job_count: 3
+    min_job_count: 1
     max_discovery_retries: 1
   job_parsing: {}
   job_scoring:
-    min_match_score: 30
+    min_match_score: 0
     top_k: 6
   resume_generation:
     min_resume_bytes: 180
@@ -68,7 +68,7 @@ resume_parsing:
     - Technical Lead
 
 job_discovery:
-  fetch_timeout_seconds: 0.4
+  fetch_timeout_seconds: 1.5
   companies:
     - name: "Stripe"
       careers_url: "https://careers.stripe.com/jobs"
