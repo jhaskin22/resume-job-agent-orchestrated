@@ -54,6 +54,8 @@ def score_jobs(
         )
 
     scored.sort(key=lambda item: float(item["match_score"]), reverse=True)
+    if top_k <= 0:
+        return scored
     return scored[:top_k]
 
 

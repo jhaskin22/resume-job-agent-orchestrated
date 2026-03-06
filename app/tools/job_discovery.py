@@ -7,55 +7,158 @@ import time
 from dataclasses import dataclass
 from html import unescape
 from pathlib import Path
-from urllib.parse import urljoin, urlparse
+from typing import Any
+from urllib.parse import quote, urlencode, urljoin, urlparse
 from urllib.request import Request, urlopen
 
 logger = logging.getLogger(__name__)
 
+SOFTWARE_ROLE_INCLUDE = (
+    "software engineer",
+    "backend engineer",
+    "platform engineer",
+    "systems engineer",
+    "embedded engineer",
+    "firmware engineer",
+    "full stack engineer",
+    "site reliability engineer",
+    "devops engineer",
+)
+
+SOFTWARE_ROLE_HINTS = (
+    "software",
+    "backend",
+    "platform",
+    "systems",
+    "embedded",
+    "firmware",
+    "full-stack",
+    "fullstack",
+    "devops",
+    "sre",
+    "infrastructure",
+)
+
+SOFTWARE_ROLE_EXCLUDE = (
+    "data scientist",
+    "machine learning researcher",
+    "ml researcher",
+    "sales",
+    "marketing",
+    "human resources",
+    "hr ",
+    "finance",
+    "product manager",
+    "recruiter",
+)
+
+SKILL_VOCABULARY = {
+    "c",
+    "c++",
+    "python",
+    "java",
+    "go",
+    "rust",
+    "javascript",
+    "typescript",
+    "sql",
+    "linux",
+    "embedded",
+    "firmware",
+    "networking",
+    "distributed systems",
+    "aws",
+    "docker",
+    "kubernetes",
+    "postgres",
+    "redis",
+    "kafka",
+    "terraform",
+}
+
+TECH_VOCABULARY = {
+    "aws",
+    "docker",
+    "kubernetes",
+    "postgres",
+    "redis",
+    "kafka",
+    "terraform",
+    "linux",
+    "networking",
+    "distributed systems",
+    "embedded",
+    "firmware",
+}
+
 JOB_PATH_HINTS = ("/jobs/", "/job/", "/positions/")
+ATS_DOMAIN_HINTS = (
+    "boards.greenhouse.io",
+    "api.lever.co",
+    "jobs.ashbyhq.com",
+    "ashbyhq.com",
+    "myworkdayjobs.com",
+    "wd1.myworkdayjobs.com",
+    "wd3.myworkdayjobs.com",
+    "smartrecruiters.com",
+    "icims.com",
+    "taleo.net",
+)
 REJECT_PATH_HINTS = (
     "about",
     "team",
     "culture",
     "benefits",
-    "company",
     "blog",
-    "story",
     "stories",
+    "story",
     "category",
-    "summit",
-    "conference",
-    "agenda",
+    "news",
     "event",
 )
-BLOCKED_JOB_SOURCES = (
-    "greenhouse",
-    "lever",
-    "ashby",
-    "linkedin",
-    "indeed",
-    "wellfound",
-)
+
+CAREERS_URL_OVERRIDES = {
+    "Stripe": "https://stripe.com/jobs/search",
+    "Cloudflare": "https://www.cloudflare.com/careers/jobs/",
+    "Datadog": "https://careers.datadoghq.com/",
+    "MongoDB": "https://www.mongodb.com/careers",
+    "Twilio": "https://jobs.twilio.com/careers",
+    "Toyota Connected": "https://toyotaconnected.com/careers",
+    "Bell": "https://textron.taleo.net/careersection/bell/jobsearch.ftl?lang=en",
+    "NVIDIA": "https://nvidia.wd5.myworkdayjobs.com/NVIDIAExternalCareerSite",
+}
 
 
 @dataclass(slots=True)
 class DiscoveryConfig:
     companies: list[dict[str, object]]
-    max_jobs: int
+    max_jobs: int | None
     timeout_seconds: float
     fallback_jobs: list[dict[str, object]]
     use_fallback: bool = True
     cache_path: str | None = None
+    max_jobs_per_company: int = 0
+    global_budget_seconds: float = 0.0
+
+
+@dataclass(slots=True)
+class AtsDetection:
+    ats_type: str
+    company_key: str
 
 
 def discover_jobs(config: DiscoveryConfig) -> list[dict[str, object]]:
     jobs: list[dict[str, object]] = []
-    companies = sorted(config.companies, key=_company_priority)
+    started = time.monotonic()
+    global_budget_seconds = float(config.global_budget_seconds)
+    companies = _prioritized_companies(config.companies)
 
     for company in companies:
-        if len(jobs) >= config.max_jobs:
+        if global_budget_seconds > 0 and time.monotonic() - started > global_budget_seconds:
             break
         discovered = _discover_company_jobs(company, config.timeout_seconds)
+        if int(config.max_jobs_per_company) > 0:
+            discovered = discovered[: int(config.max_jobs_per_company)]
         logger.info(
             "job_discovery company=%s found=%s",
             company.get("name", "unknown"),
@@ -66,22 +169,12 @@ def discover_jobs(config: DiscoveryConfig) -> list[dict[str, object]]:
     if jobs and config.cache_path:
         _write_cache(config.cache_path, jobs)
 
-    if config.use_fallback and len(jobs) < config.max_jobs:
-        cached = _read_cache(config.cache_path) if config.cache_path else []
+    if config.use_fallback:
+        cached = _read_cache(config.cache_path)
         logger.info("job_discovery using cached jobs count=%s", len(cached))
         jobs.extend(cached)
 
-    unique: list[dict[str, object]] = []
-    seen_links: set[str] = set()
-    for job in jobs:
-        link = str(job.get("job_link", ""))
-        if link in seen_links:
-            continue
-        seen_links.add(link)
-        unique.append(job)
-        if len(unique) >= config.max_jobs:
-            break
-
+    unique = _dedupe_jobs(jobs)
     return unique
 
 
@@ -89,137 +182,1286 @@ def _discover_company_jobs(
     company_cfg: dict[str, object],
     timeout_seconds: float,
 ) -> list[dict[str, object]]:
+    started = time.monotonic()
+    company_budget_seconds = max(10.0, timeout_seconds * 6.0)
     company_name = str(company_cfg.get("name", "Unknown Company"))
-    career_url = str(company_cfg.get("careers_url", "")).strip()
-    default_location = str(company_cfg.get("default_location", "Remote - US"))
-    default_work_type = str(company_cfg.get("default_work_type", "remote"))
+    raw_careers_url = str(company_cfg.get("careers_url", "")).strip()
+    careers_url = _effective_careers_url(company_name, raw_careers_url)
+    default_location = str(company_cfg.get("default_location", "United States"))
+    default_work_type = str(company_cfg.get("default_work_type", "hybrid"))
+    if not careers_url:
+        return []
+    page_ctx = _fetch_page_context(careers_url, timeout_seconds)
+    html = page_ctx["html"]
+    status = int(page_ctx["status"])
+    final_url = str(page_ctx["final_url"])
+    detection = _detect_ats(careers_url, html, final_url, company_name=company_name)
+    jobs: list[dict[str, object]] = []
+    provider = detection.ats_type if detection else "direct"
+    ingest_path = "provider" if detection else "fallback"
 
-    if not career_url:
+    if detection is not None:
+        logger.info(
+            "job_discovery provider_detected company=%s provider=%s",
+            company_name,
+            provider,
+        )
+        jobs.extend(
+            _discover_jobs_via_ats(
+                company_name=company_name,
+                careers_url=careers_url,
+                default_location=default_location,
+                default_work_type=default_work_type,
+                detection=detection,
+                timeout_seconds=timeout_seconds,
+            )
+        )
+    pre_filter_count = len(jobs)
+
+    if len(jobs) < 4:
+        if time.monotonic() - started > company_budget_seconds:
+            kept = _finalize_company_jobs(jobs)
+            logger.info(
+                "job_discovery company=%s provider=%s path=%s status=%s pre=%s post=%s reason=%s",
+                company_name,
+                provider,
+                ingest_path,
+                status,
+                pre_filter_count,
+                len(kept),
+                "company-time-budget-exceeded",
+            )
+            return kept
+        ingest_path = "provider+fallback" if detection else "fallback"
+        crawl_root = final_url or careers_url
+        jobs.extend(
+            _discover_jobs_via_fallback_crawler(
+                company_name=company_name,
+                careers_url=crawl_root,
+                default_location=default_location,
+                default_work_type=default_work_type,
+                initial_html=html,
+                timeout_seconds=timeout_seconds,
+            )
+        )
+    kept = _finalize_company_jobs(jobs)
+    reason = "ok" if kept else "no-matching-software-jobs"
+    logger.info(
+        "job_discovery company=%s provider=%s path=%s status=%s pre=%s post=%s reason=%s",
+        company_name,
+        provider,
+        ingest_path,
+        status,
+        len(jobs),
+        len(kept),
+        reason,
+    )
+    return kept
+
+
+def _finalize_company_jobs(jobs: list[dict[str, object]]) -> list[dict[str, object]]:
+    deduped = _dedupe_jobs(jobs)
+    filtered = [job for job in deduped if _is_relevant_software_job(job)]
+    filtered.sort(key=_job_rank, reverse=True)
+    return filtered
+
+
+def _discover_jobs_via_ats(
+    *,
+    company_name: str,
+    careers_url: str,
+    default_location: str,
+    default_work_type: str,
+    detection: AtsDetection,
+    timeout_seconds: float,
+) -> list[dict[str, object]]:
+    try:
+        if detection.ats_type == "greenhouse":
+            return _greenhouse_jobs(
+                company_name,
+                detection.company_key,
+                careers_url,
+                default_location,
+                default_work_type,
+                timeout_seconds,
+            )
+        if detection.ats_type == "lever":
+            return _lever_jobs(
+                company_name,
+                detection.company_key,
+                careers_url,
+                default_location,
+                default_work_type,
+                timeout_seconds,
+            )
+        if detection.ats_type == "ashby":
+            return _ashby_jobs(
+                company_name,
+                detection.company_key,
+                careers_url,
+                default_location,
+                default_work_type,
+                timeout_seconds,
+            )
+        if detection.ats_type == "workday":
+            return _workday_jobs(
+                company_name,
+                detection.company_key,
+                careers_url,
+                default_location,
+                default_work_type,
+                timeout_seconds,
+            )
+        if detection.ats_type == "smartrecruiters":
+            return _smartrecruiters_jobs(
+                company_name,
+                detection.company_key,
+                careers_url,
+                default_location,
+                default_work_type,
+                timeout_seconds,
+            )
+        if detection.ats_type == "icims":
+            return _icims_jobs(
+                company_name,
+                detection.company_key,
+                careers_url,
+                default_location,
+                default_work_type,
+                timeout_seconds,
+            )
+        if detection.ats_type == "jibe":
+            return _jibe_jobs(
+                company_name,
+                detection.company_key,
+                careers_url,
+                default_location,
+                default_work_type,
+                timeout_seconds,
+            )
+        if detection.ats_type == "taleo":
+            return _taleo_jobs(
+                company_name,
+                detection.company_key,
+                careers_url,
+                default_location,
+                default_work_type,
+                timeout_seconds,
+            )
+    except Exception:  # noqa: BLE001
+        logger.exception("ats_discovery_failed company=%s ats=%s", company_name, detection.ats_type)
+    return []
+
+
+def _detect_ats(
+    careers_url: str,
+    html: str,
+    final_url: str = "",
+    *,
+    company_name: str = "",
+) -> AtsDetection | None:
+    signal_text = _provider_signal_text(careers_url, final_url, html)
+    board = _extract_greenhouse_board(careers_url, html)
+    if board:
+        return AtsDetection("greenhouse", board)
+
+    lever = _extract_lever_company(careers_url, html)
+    if lever:
+        return AtsDetection("lever", lever)
+
+    ashby = _extract_ashby_company(careers_url, html)
+    if ashby:
+        return AtsDetection("ashby", ashby)
+
+    workday = _extract_workday_tenant_site(careers_url, html)
+    if workday:
+        return AtsDetection("workday", workday)
+
+    smart = _extract_smartrecruiters_company(careers_url, html)
+    if smart:
+        return AtsDetection("smartrecruiters", smart)
+
+    jibe = _extract_jibe_site(careers_url, html, final_url)
+    if jibe:
+        return AtsDetection("jibe", jibe)
+
+    icims = _extract_icims_host(careers_url, html)
+    if icims:
+        return AtsDetection("icims", icims)
+    taleo = _extract_taleo_site(careers_url, html)
+    if taleo:
+        return AtsDetection("taleo", taleo)
+    if "myworkdayjobs.com" in signal_text:
+        workday = _extract_workday_tenant_site(final_url or careers_url, html)
+        if workday:
+            return AtsDetection("workday", workday)
+    if "greenhouse" in signal_text:
+        board_guess = _guess_company_slug(careers_url)
+        if board_guess:
+            return AtsDetection("greenhouse", board_guess)
+    if "lever.co" in signal_text:
+        lever_guess = _guess_company_slug(careers_url)
+        if lever_guess:
+            return AtsDetection("lever", lever_guess)
+    if "ashbyhq.com" in signal_text:
+        ashby_guess = _guess_company_slug(careers_url)
+        if ashby_guess:
+            return AtsDetection("ashby", ashby_guess)
+    if "smartrecruiters.com" in signal_text:
+        smart_guess = _guess_company_slug(careers_url)
+        if smart_guess:
+            return AtsDetection("smartrecruiters", smart_guess)
+    if "taleo.net" in signal_text:
+        taleo_guess = _extract_taleo_site(final_url or careers_url, html)
+        if taleo_guess:
+            return AtsDetection("taleo", taleo_guess)
+    probed = _probe_ats_from_company_name(company_name, careers_url)
+    if probed is not None:
+        return probed
+    return None
+
+
+def _provider_signal_text(careers_url: str, final_url: str, html: str) -> str:
+    snippets = [careers_url, final_url, html]
+    return "\n".join(snippet for snippet in snippets if snippet).lower()
+
+
+def _greenhouse_jobs(
+    company_name: str,
+    board: str,
+    careers_url: str,
+    default_location: str,
+    default_work_type: str,
+    timeout_seconds: float,
+) -> list[dict[str, object]]:
+    api_url = f"https://boards-api.greenhouse.io/v1/boards/{quote(board)}/jobs"
+    payload = _http_get_json(api_url, timeout_seconds)
+    if not isinstance(payload, dict):
+        return []
+    jobs = payload.get("jobs", [])
+    if not isinstance(jobs, list):
         return []
 
-    started_at = time.monotonic()
-    page_budget_seconds = max(4.0, timeout_seconds * 8.0)
-    post_budget_seconds = max(6.0, timeout_seconds * 12.0)
+    found: list[dict[str, object]] = []
+    for item in jobs[:250]:
+        if len(found) >= 10:
+            break
+        if not isinstance(item, dict):
+            continue
+        url = str(item.get("absolute_url", "")).strip()
+        title = str(item.get("title", "")).strip()
+        if not url or not title:
+            continue
+        content = str(item.get("content", ""))
+        description = _clean_text(content)[:2600]
+        candidate = {
+            "company": company_name,
+            "title": title,
+            "description": description or f"{title} role at {company_name}.",
+        }
+        if not _is_relevant_software_job(candidate):
+            continue
+        location = _extract_greenhouse_location(item, default_location)
+        salary = _extract_salary(description)
+        work_type = _guess_work_type(f"{title} {description}", default_work_type)
+        found.append(
+            _job_record(
+                company=company_name,
+                title=title,
+                location=location,
+                salary=salary,
+                description=description,
+                url=url,
+                work_type=work_type,
+                source_provider="greenhouse",
+            )
+        )
+    return found
 
-    html = _fetch_html(career_url, timeout_seconds)
-    if html:
-        logger.info("career_page_fetched url=%s", career_url)
+
+def _lever_jobs(
+    company_name: str,
+    company_key: str,
+    careers_url: str,
+    default_location: str,
+    default_work_type: str,
+    timeout_seconds: float,
+) -> list[dict[str, object]]:
+    api_url = f"https://api.lever.co/v0/postings/{quote(company_key)}?mode=json"
+    payload = _http_get_json(api_url, timeout_seconds)
+    if not isinstance(payload, list):
+        return []
 
     found: list[dict[str, object]] = []
-    candidate_labels: dict[str, str] = {}
-    candidate_urls: list[str] = []
-    page_queue = [career_url] if html else []
-    visited_pages: set[str] = set()
-
-    while page_queue and len(visited_pages) < 3:
-        if time.monotonic() - started_at > page_budget_seconds:
+    for item in payload[:120]:
+        if len(found) >= 10:
             break
-        page_url = page_queue.pop(0)
-        if page_url in visited_pages:
+        if not isinstance(item, dict):
             continue
-        visited_pages.add(page_url)
-        page_html = html if page_url == career_url else _fetch_html(page_url, timeout_seconds)
-        if not page_html:
+        url = str(item.get("hostedUrl", "")).strip() or str(item.get("applyUrl", "")).strip()
+        title = str(item.get("text", "")).strip()
+        if not url or not title:
             continue
-        extracted = _extract_links(page_html)
-        logger.info("job_links_extracted url=%s count=%s", page_url, len(extracted))
-        for href, label in extracted:
-            absolute = urljoin(page_url, href)
-            if not _is_official_company_url(absolute, career_url):
-                continue
-            if _looks_like_job_url(absolute, label):
-                if absolute not in candidate_labels:
-                    candidate_urls.append(absolute)
-                    candidate_labels[absolute] = label
-                continue
-            if _looks_like_job_hub_url(absolute):
-                page_queue.append(absolute)
-
-        for absolute, label in _extract_job_urls_from_json_ld(page_html, page_url):
-            if not _is_official_company_url(absolute, career_url):
-                continue
-            if not _looks_like_job_url(absolute, label):
-                continue
-            if absolute not in candidate_labels:
-                candidate_urls.append(absolute)
-                candidate_labels[absolute] = label
-
-    if len(candidate_urls) < 6:
-        for absolute in _discover_job_urls_from_sitemap(career_url, timeout_seconds):
-            if not _is_official_company_url(absolute, career_url):
-                continue
-            if not _looks_like_job_url(absolute, ""):
-                continue
-            if absolute not in candidate_labels:
-                candidate_urls.append(absolute)
-                candidate_labels[absolute] = ""
-
-    for absolute in candidate_urls[:15]:
-        if time.monotonic() - started_at > post_budget_seconds:
-            break
-        posting_html = _fetch_html(absolute, timeout_seconds)
-        if not posting_html:
-            continue
-        posting_text = _extract_posting_text(posting_html)
-        logger.info("job_page_parsed url=%s", absolute)
-        label = candidate_labels.get(absolute, "")
-        raw_title = _clean_title(label) or _extract_title(posting_html) or _title_from_url(absolute)
-        title = _clean_title(raw_title)
-        if _looks_placeholder_title(title):
-            title = _title_from_url(absolute)
-        if len(title.split()) > 14:
-            title = " ".join(title.split()[:14])
-        location = _extract_location(posting_text, default_location)
-        work_type = _guess_work_type(f"{title} {posting_text}", default_work_type)
-        salary = _extract_salary(posting_text)
-        technologies = _extract_technologies(posting_text)
-        description = _build_description(posting_text)
-        if len(description.split()) < 20:
-            description = (
-                f"{title} role at {company_name}. This position includes core engineering "
-                "responsibilities, collaboration across teams, production system ownership, "
-                "and delivery of reliable software solutions."
-            )
+        description = _clean_text(str(item.get("descriptionPlain", "")))
+        if not description:
+            description = _clean_text(str(item.get("description", "")))
+        location = _extract_lever_location(item, default_location)
+        salary = _extract_salary(description)
+        work_type = _guess_work_type(f"{title} {description}", default_work_type)
         found.append(
-            {
-                "company": company_name,
-                "title": title,
-                "role": title,
-                "job_url": absolute,
-                "verified_url": absolute,
-                "job_link": absolute,
-                "location": location,
-                "salary": salary,
-                "work_type": work_type,
-                "required_technologies": technologies,
-                "description": description,
-            }
+            _job_record(
+                company=company_name,
+                title=title,
+                location=location,
+                salary=salary,
+                description=description,
+                url=url,
+                work_type=work_type,
+                source_provider="lever",
+            )
         )
-        if len(found) >= 8:
+    return found
+
+
+def _ashby_jobs(
+    company_name: str,
+    company_key: str,
+    careers_url: str,
+    default_location: str,
+    default_work_type: str,
+    timeout_seconds: float,
+) -> list[dict[str, object]]:
+    api_url = f"https://api.ashbyhq.com/posting-api/job-board/{quote(company_key)}"
+    payload = _http_get_json(api_url, timeout_seconds)
+    if not isinstance(payload, dict):
+        return []
+
+    jobs = payload.get("jobs")
+    if not isinstance(jobs, list):
+        return []
+
+    found: list[dict[str, object]] = []
+    for item in jobs[:120]:
+        if len(found) >= 10:
+            break
+        if not isinstance(item, dict):
+            continue
+        url = str(item.get("jobUrl", "")).strip() or str(item.get("jobPostUrl", "")).strip()
+        title = str(item.get("title", "")).strip()
+        if not url or not title:
+            continue
+        description = _clean_text(str(item.get("descriptionHtml", "")))
+        location = _extract_ashby_location(item, default_location)
+        salary = _extract_salary(description)
+        work_type = _guess_work_type(f"{title} {description}", default_work_type)
+        found.append(
+            _job_record(
+                company=company_name,
+                title=title,
+                location=location,
+                salary=salary,
+                description=description,
+                url=url,
+                work_type=work_type,
+                source_provider="ashby",
+            )
+        )
+    return found
+
+
+def _workday_jobs(
+    company_name: str,
+    tenant_site: str,
+    careers_url: str,
+    default_location: str,
+    default_work_type: str,
+    timeout_seconds: float,
+) -> list[dict[str, object]]:
+    parts = tenant_site.split("|")
+    if len(parts) == 3:
+        host, tenant, site = parts
+        base = f"https://{host}"
+    else:
+        tenant, site = tenant_site.split("|", maxsplit=1)
+        base = f"https://{tenant}.myworkdayjobs.com"
+    api_url = f"{base}/wday/cxs/{tenant}/{site}/jobs"
+    payloads: list[dict[str, Any]] = []
+    first = _http_post_json(api_url, {"limit": 50, "offset": 0}, timeout_seconds)
+    if isinstance(first, dict):
+        payloads.append(first)
+    for keyword in ("engineer", "software", "platform", "systems", "developer", "firmware"):
+        match_payload = _http_post_json(
+            api_url,
+            {"limit": 25, "offset": 0, "searchText": keyword},
+            timeout_seconds,
+        )
+        if isinstance(match_payload, dict):
+            payloads.append(match_payload)
+
+    jobs: list[dict[str, Any]] = []
+    for payload in payloads:
+        batch = payload.get("jobPostings", [])
+        if isinstance(batch, list):
+            jobs.extend(item for item in batch if isinstance(item, dict))
+    if not jobs:
+        return []
+
+    found: list[dict[str, object]] = []
+    seen_urls: set[str] = set()
+    for item in jobs[:120]:
+        if len(found) >= 10:
+            break
+        if not isinstance(item, dict):
+            continue
+        title = str(item.get("title", "")).strip()
+        path = str(item.get("externalPath", "")).strip()
+        if not title or not path:
+            continue
+        url = urljoin(careers_url.rstrip("/") + "/", path.lstrip("/"))
+        if url in seen_urls:
+            continue
+        seen_urls.add(url)
+        description = _clean_text(str(item.get("bulletFields", "")))
+        location = _extract_workday_location(item, default_location)
+        salary = _extract_salary(description)
+        work_type = _guess_work_type(f"{title} {description}", default_work_type)
+        found.append(
+            _job_record(
+                company=company_name,
+                title=title,
+                location=location,
+                salary=salary,
+                description=description,
+                url=url,
+                work_type=work_type,
+                source_provider="workday",
+            )
+        )
+    return found
+
+
+def _smartrecruiters_jobs(
+    company_name: str,
+    company_key: str,
+    careers_url: str,
+    default_location: str,
+    default_work_type: str,
+    timeout_seconds: float,
+) -> list[dict[str, object]]:
+    params = urlencode({"limit": 100, "offset": 0})
+    api_url = f"https://api.smartrecruiters.com/v1/companies/{quote(company_key)}/postings?{params}"
+    payload = _http_get_json(api_url, timeout_seconds)
+    if not isinstance(payload, dict):
+        return []
+
+    jobs = payload.get("content", [])
+    if not isinstance(jobs, list):
+        return []
+
+    found: list[dict[str, object]] = []
+    for item in jobs[:120]:
+        if len(found) >= 10:
+            break
+        if not isinstance(item, dict):
+            continue
+        title = str(item.get("name", "")).strip()
+        url = str(item.get("ref", "")).strip() or str(item.get("applyUrl", "")).strip()
+        if not title or not url:
+            continue
+        location = _extract_smart_location(item, default_location)
+        description = _clean_text(str(item.get("jobAd", "")))
+        salary = _extract_salary(description)
+        work_type = _guess_work_type(f"{title} {description}", default_work_type)
+        found.append(
+            _job_record(
+                company=company_name,
+                title=title,
+                location=location,
+                salary=salary,
+                description=description,
+                url=url,
+                work_type=work_type,
+                source_provider="smartrecruiters",
+            )
+        )
+    return found
+
+
+def _icims_jobs(
+    company_name: str,
+    icims_host: str,
+    careers_url: str,
+    default_location: str,
+    default_work_type: str,
+    timeout_seconds: float,
+) -> list[dict[str, object]]:
+    search_urls = [
+        f"https://{icims_host}/jobs/search?ss=1",
+        f"https://{icims_host}/jobs/search?pr=1&searchRelation=keyword_all",
+    ]
+    candidate_urls: dict[str, str] = {}
+    for search_url in search_urls:
+        status, html = _http_get_text(search_url, timeout_seconds)
+        if status != 200 or not html:
+            continue
+        for href, label in _extract_links(html):
+            absolute = urljoin(search_url, href)
+            if _looks_like_job_url(absolute, label):
+                candidate_urls.setdefault(absolute, label)
+
+    found: list[dict[str, object]] = []
+    for url, label in list(candidate_urls.items())[:20]:
+        status, posting_html = _http_get_text(url, timeout_seconds)
+        if status != 200 or not posting_html:
+            continue
+        description = _extract_posting_text(posting_html)
+        title = _clean_title(label) or _extract_title(posting_html) or _title_from_url(url)
+        if not title:
+            continue
+        location = _extract_location_from_posting(posting_html, description, default_location)
+        salary = _extract_salary(description)
+        work_type = _guess_work_type(f"{title} {description}", default_work_type)
+        found.append(
+            _job_record(
+                company=company_name,
+                title=title,
+                location=location,
+                salary=salary,
+                description=description,
+                url=url,
+                work_type=work_type,
+                source_provider="icims",
+            )
+        )
+        if len(found) >= 10:
             break
     return found
 
 
-def _fetch_html(url: str, timeout_seconds: float, max_bytes: int = 1_500_000) -> str:
+def _taleo_jobs(
+    company_name: str,
+    taleo_site: str,
+    careers_url: str,
+    default_location: str,
+    default_work_type: str,
+    timeout_seconds: float,
+) -> list[dict[str, object]]:
+    parts = taleo_site.split("|")
+    if len(parts) != 4:
+        return []
+    host, section, lang, portal = parts
+    search_url = f"https://{host}/careersection/rest/jobboard/searchjobs?lang={quote(lang)}&portal={quote(portal)}"
+    headers = {"tz": "UTC", "tzname": "UTC"}
+    payload = _http_post_json(search_url, {"pageNo": 1}, timeout_seconds, headers=headers)
+    if not isinstance(payload, dict):
+        return []
+    paging = payload.get("pagingData", {})
+    total_count = int(paging.get("totalCount", 0)) if isinstance(paging, dict) else 0
+    page_size = int(paging.get("pageSize", 25)) if isinstance(paging, dict) else 25
+    max_pages = max(1, min(8, (total_count // max(1, page_size)) + 1))
+
+    pages = [payload]
+    for page_no in range(2, max_pages + 1):
+        page_payload = _http_post_json(
+            search_url,
+            {"pageNo": page_no},
+            timeout_seconds,
+            headers=headers,
+        )
+        if isinstance(page_payload, dict):
+            pages.append(page_payload)
+
+    found: list[dict[str, object]] = []
+    seen_urls: set[str] = set()
+    for page_payload in pages:
+        req_list = page_payload.get("requisitionList", [])
+        if not isinstance(req_list, list):
+            continue
+        for item in req_list:
+            if not isinstance(item, dict):
+                continue
+            contest_no = str(item.get("contestNo", "")).strip()
+            columns = item.get("column", [])
+            title = str(columns[0]).strip() if isinstance(columns, list) and columns else ""
+            if not contest_no or not title:
+                continue
+            title_lower = title.lower()
+            if any(token in title_lower for token in SOFTWARE_ROLE_EXCLUDE):
+                continue
+            software_title_tokens = SOFTWARE_ROLE_HINTS + ("engineer", "developer")
+            if not any(token in title_lower for token in software_title_tokens):
+                continue
+            url = (
+                f"https://{host}/careersection/{section}/jobdetail.ftl"
+                f"?job={quote(contest_no)}&lang={quote(lang)}"
+            )
+            if url in seen_urls:
+                continue
+            seen_urls.add(url)
+            location = _extract_taleo_location(item, default_location)
+            description = _extract_taleo_description(url, timeout_seconds)
+            if not description:
+                description = f"{title} role at {company_name} in {location}."
+            salary = _extract_salary(description)
+            work_type = _guess_work_type(f"{title} {description}", default_work_type)
+            found.append(
+                _job_record(
+                    company=company_name,
+                    title=title,
+                    location=location,
+                    salary=salary,
+                    description=description,
+                    url=url,
+                    work_type=work_type,
+                    source_provider="taleo",
+                )
+            )
+    return found
+
+
+def _jibe_jobs(
+    company_name: str,
+    jibe_key: str,
+    careers_url: str,
+    default_location: str,
+    default_work_type: str,
+    timeout_seconds: float,
+) -> list[dict[str, object]]:
+    parts = jibe_key.split("|")
+    if len(parts) < 2:
+        return []
+    base_url = parts[0].rstrip("/")
+    client = parts[1].strip() or _guess_company_slug(careers_url)
+    if not client:
+        return []
+    ref_url = parts[2] if len(parts) >= 3 else careers_url
+    found: list[dict[str, object]] = []
+
+    for page in range(1, 5):
+        query = urlencode({"domain": f"{client}.jibeapply.com", "page": page, "limit": 50})
+        payload = _http_get_json(
+            f"{base_url}/api/jobs?{query}",
+            timeout_seconds=max(timeout_seconds, 2.0),
+            max_bytes=5_000_000,
+        )
+        if not isinstance(payload, dict):
+            break
+        jobs = payload.get("jobs", [])
+        if not isinstance(jobs, list) or not jobs:
+            break
+        for item in jobs:
+            if len(found) >= 20:
+                break
+            if not isinstance(item, dict):
+                continue
+            data = item.get("data", {})
+            if not isinstance(data, dict):
+                continue
+            title = str(data.get("title", "")).strip()
+            if not title:
+                continue
+            description = _clean_text(str(data.get("description", "")))
+            candidate = {"company": company_name, "title": title, "description": description}
+            if not _is_relevant_software_job(candidate):
+                continue
+            location = (
+                str(data.get("location_name", "")).strip()
+                or ", ".join(
+                    part
+                    for part in (
+                        str(data.get("city", "")).strip(),
+                        str(data.get("state", "")).strip(),
+                        str(data.get("country", "")).strip(),
+                    )
+                    if part
+                )
+                or default_location
+            )
+            raw_url = str(data.get("apply_url", "")).strip()
+            if not raw_url:
+                slug = str(data.get("slug", "")).strip()
+                if slug:
+                    raw_url = f"{base_url}/jobs/{slug}/login"
+            if not raw_url:
+                continue
+            url = raw_url if raw_url.startswith("http") else urljoin(ref_url, raw_url)
+            salary = _extract_salary(description)
+            work_type = _guess_work_type(f"{title} {description} {location}", default_work_type)
+            found.append(
+                _job_record(
+                    company=company_name,
+                    title=title,
+                    location=location,
+                    salary=salary,
+                    description=description,
+                    url=url,
+                    work_type=work_type,
+                    source_provider="jibe",
+                )
+            )
+        if len(found) >= 20:
+            break
+    return found
+
+
+def _discover_jobs_via_fallback_crawler(
+    *,
+    company_name: str,
+    careers_url: str,
+    default_location: str,
+    default_work_type: str,
+    initial_html: str,
+    timeout_seconds: float,
+) -> list[dict[str, object]]:
+    queue = [careers_url]
+    visited_pages: set[str] = set()
+    candidate_urls: dict[str, str] = {}
+
+    while queue and len(visited_pages) < 3:
+        page_url = queue.pop(0)
+        if page_url in visited_pages:
+            continue
+        visited_pages.add(page_url)
+
+        status, html = (
+            (200, initial_html)
+            if page_url == careers_url and initial_html
+            else _http_get_text(page_url, timeout_seconds)
+        )
+        if status != 200 or not html:
+            continue
+
+        for href, label in _extract_links(html):
+            absolute = urljoin(page_url, href)
+            if not _is_same_or_linked_domain(absolute, careers_url):
+                continue
+            if _looks_like_job_url(absolute, label):
+                candidate_urls.setdefault(absolute, label)
+            elif _looks_like_job_hub_url(absolute):
+                queue.append(absolute)
+
+        for absolute, label in _extract_job_urls_from_json_ld(html, page_url):
+            if _is_same_or_linked_domain(absolute, careers_url):
+                candidate_urls.setdefault(absolute, label)
+
+    if len(candidate_urls) < 8:
+        for url in _discover_job_urls_from_sitemap(careers_url, timeout_seconds):
+            if _is_same_or_linked_domain(url, careers_url):
+                candidate_urls.setdefault(url, "")
+
+    found: list[dict[str, object]] = []
+    prioritized_candidates = sorted(
+        candidate_urls.items(),
+        key=lambda pair: _candidate_priority(pair[0], pair[1]),
+    )
+    attempts = 0
+    for url, label in prioritized_candidates[:60]:
+        attempts += 1
+        if attempts > 12:
+            break
+        status, posting_html = _http_get_text(url, timeout_seconds)
+        if status != 200 or not posting_html:
+            continue
+
+        description = _extract_posting_text(posting_html)
+        title = _clean_title(label) or _extract_title(posting_html) or _title_from_url(url)
+        if not title:
+            continue
+
+        location = _extract_location_from_posting(posting_html, description, default_location)
+        salary = _extract_salary(description)
+        work_type = _guess_work_type(f"{title} {description}", default_work_type)
+        found.append(
+            _job_record(
+                company=company_name,
+                title=title,
+                location=location,
+                salary=salary,
+                description=description,
+                url=url,
+                work_type=work_type,
+                source_provider="direct",
+            )
+        )
+    return found
+
+
+def _job_record(
+    *,
+    company: str,
+    title: str,
+    location: str,
+    salary: str,
+    description: str,
+    url: str,
+    work_type: str,
+    source_provider: str = "direct",
+) -> dict[str, object]:
+    if _looks_template_text(title):
+        title = _title_from_url(url)
+    clean_description = re.sub(r"\s+", " ", description).strip()[:2800]
+    if len(clean_description.split()) < 20:
+        clean_description = (
+            f"{title} role at {company}. Responsibilities include software development, "
+            "system reliability, and collaboration across engineering teams. "
+            "Candidates should have relevant technical skills and production experience."
+        )
+    technologies = _extract_technologies(clean_description)
+    return {
+        "company": company,
+        "title": title,
+        "role": title,
+        "location": location,
+        "salary": salary,
+        "description": clean_description,
+        "required_technologies": technologies,
+        "work_type": work_type,
+        "source_provider": source_provider,
+        "url": url,
+        "job_url": url,
+        "job_link": url,
+        "verified_url": url,
+    }
+
+
+def _is_relevant_software_job(job: dict[str, object]) -> bool:
+    title = str(job.get("title", ""))
+    description = str(job.get("description", ""))
+    title_lower = title.lower()
+    description_head = description[:900].lower()
+
+    if any(term in title_lower for term in SOFTWARE_ROLE_EXCLUDE):
+        return False
+
+    if any(term in title_lower for term in SOFTWARE_ROLE_INCLUDE):
+        return True
+    if any(token in title_lower for token in ("engineer", "developer", "devops", "sre")):
+        if not any(term in title_lower for term in ("sales", "marketing", "finance", "hr")):
+            return True
+    if any(term in description_head for term in SOFTWARE_ROLE_EXCLUDE) and not any(
+        token in title_lower for token in ("engineer", "developer", "firmware", "embedded")
+    ):
+        return False
+
+    score = _job_relevance_score(title, description_head)
+    return score >= 18
+
+
+def _looks_template_text(value: str) -> bool:
+    lowered = value.lower()
+    return any(token in lowered for token in ("${", "{{", "}}", "widgetbundle", "jobdetail"))
+
+
+def _candidate_priority(url: str, label: str) -> tuple[int, int]:
+    haystack = f"{url} {label}".lower()
+    include_hits = sum(1 for hint in SOFTWARE_ROLE_HINTS if hint in haystack)
+    exclude_hits = sum(1 for term in SOFTWARE_ROLE_EXCLUDE if term in haystack)
+    # lower tuple sorts first: more include hits, fewer exclude hits.
+    return (-include_hits, exclude_hits)
+
+
+def _job_rank(job: dict[str, object]) -> float:
+    title = str(job.get("title", ""))
+    description = str(job.get("description", ""))
+    return float(_job_relevance_score(title, description))
+
+
+def _job_relevance_score(title: str, description: str) -> int:
+    title_text = title.lower()
+    text = f"{title} {description}".lower()
+    skills = _extract_technologies(text)
+
+    score = 0
+    if any(role in title_text for role in SOFTWARE_ROLE_INCLUDE):
+        score += 24
+    elif any(role in text for role in SOFTWARE_ROLE_INCLUDE):
+        score += 20
+    if "engineer" in title_text or "developer" in title_text:
+        score += 12
+    elif "engineer" in text:
+        score += 8
+
+    programming = {"c", "c++", "python", "java", "go", "rust", "javascript", "typescript"}
+    infra = {"aws", "docker", "kubernetes", "postgres", "redis", "kafka", "terraform"}
+    systems = {"linux", "embedded", "firmware", "networking", "distributed systems"}
+
+    score += len(programming.intersection(skills)) * 3
+    score += len(infra.intersection(skills)) * 2
+    score += len(systems.intersection(skills)) * 4
+    return score
+
+
+def _guess_company_slug(careers_url: str) -> str:
+    host = urlparse(careers_url).netloc.lower()
+    parts = [part for part in host.split(".") if part and part not in {"www", "careers", "jobs"}]
+    if not parts:
+        return ""
+    return re.sub(r"[^a-z0-9_-]+", "", parts[0])
+
+
+def _fetch_page_context(url: str, timeout_seconds: float) -> dict[str, object]:
     try:
+        request = Request(url, headers=_default_headers())
+        with urlopen(request, timeout=max(timeout_seconds, 1.0)) as response:
+            status = int(getattr(response, "status", 200))
+            html = response.read(2_000_000).decode("utf-8", errors="ignore")
+            final_url = str(getattr(response, "url", url))
+            return {"status": status, "html": html, "final_url": final_url}
+    except Exception:
+        return {"status": 0, "html": "", "final_url": url}
+
+
+def _http_get_text(url: str, timeout_seconds: float, max_bytes: int = 2_000_000) -> tuple[int, str]:
+    try:
+        request = Request(url, headers=_default_headers())
+        with urlopen(request, timeout=max(timeout_seconds, 1.0)) as response:
+            status = int(getattr(response, "status", 200))
+            payload = response.read(max_bytes).decode("utf-8", errors="ignore")
+            return (status, payload)
+    except Exception:
+        return (0, "")
+
+
+def _http_get_json(url: str, timeout_seconds: float, max_bytes: int = 6_000_000) -> Any:
+    status, payload = _http_get_text(url, timeout_seconds, max_bytes=max_bytes)
+    if status != 200 or not payload:
+        return None
+    try:
+        return json.loads(payload)
+    except Exception:
+        return None
+
+
+def _probe_ats_from_company_name(company_name: str, careers_url: str) -> AtsDetection | None:
+    candidates = _slug_candidates(company_name, careers_url)
+    for slug in candidates:
+        payload = _http_get_json(
+            f"https://boards-api.greenhouse.io/v1/boards/{quote(slug)}/jobs",
+            timeout_seconds=1.5,
+            max_bytes=3_500_000,
+        )
+        if isinstance(payload, dict) and isinstance(payload.get("jobs"), list):
+            return AtsDetection("greenhouse", slug)
+    for slug in candidates:
+        payload = _http_get_json(
+            f"https://api.lever.co/v0/postings/{quote(slug)}?mode=json",
+            timeout_seconds=1.5,
+            max_bytes=900_000,
+        )
+        if isinstance(payload, list):
+            return AtsDetection("lever", slug)
+    for slug in candidates:
+        payload = _http_get_json(
+            f"https://api.ashbyhq.com/posting-api/job-board/{quote(slug)}",
+            timeout_seconds=1.5,
+            max_bytes=900_000,
+        )
+        if isinstance(payload, dict) and isinstance(payload.get("jobs"), list):
+            return AtsDetection("ashby", slug)
+    return None
+
+
+def _slug_candidates(company_name: str, careers_url: str) -> list[str]:
+    out: list[str] = []
+    parsed = urlparse(careers_url)
+    host_parts = [part for part in parsed.netloc.lower().split(".") if part]
+    for part in host_parts:
+        if part in {"www", "careers", "jobs", "job", "com", "io", "net", "org"}:
+            continue
+        normalized = re.sub(r"[^a-z0-9_-]+", "", part)
+        if normalized:
+            out.append(normalized)
+    name_slug = re.sub(r"[^a-z0-9]+", "", company_name.lower())
+    if name_slug:
+        out.append(name_slug)
+    dashed = re.sub(r"[^a-z0-9]+", "-", company_name.lower()).strip("-")
+    if dashed:
+        out.append(dashed)
+    return list(dict.fromkeys(out))
+
+
+def _http_post_json(
+    url: str,
+    body: dict[str, object],
+    timeout_seconds: float,
+    headers: dict[str, str] | None = None,
+) -> Any:
+    try:
+        payload = json.dumps(body).encode("utf-8")
         request = Request(
             url,
-            headers={
-                "User-Agent": (
-                    "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 "
-                    "(KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
-                ),
-                "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
-            },
+            data=payload,
+            headers={**_default_headers(), "Content-Type": "application/json", **(headers or {})},
+            method="POST",
         )
-        with urlopen(request, timeout=timeout_seconds) as response:
-            status = getattr(response, "status", 200)
+        with urlopen(request, timeout=max(timeout_seconds, 1.0)) as response:
+            status = int(getattr(response, "status", 200))
             if status != 200:
-                return ""
-            payload = response.read(max_bytes)
+                return None
+            text = response.read(2_000_000).decode("utf-8", errors="ignore")
+            return json.loads(text)
     except Exception:
+        return None
+
+
+def _verify_url_200(url: str, timeout_seconds: float) -> bool:
+    status, _ = _http_get_text(url, timeout_seconds, max_bytes=128_000)
+    return status == 200
+
+
+def _default_headers() -> dict[str, str]:
+    return {
+        "User-Agent": (
+            "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 "
+            "(KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
+        ),
+        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+    }
+
+
+def _extract_greenhouse_board(careers_url: str, html: str) -> str:
+    query_match = re.search(
+        r"boards\.greenhouse\.io/embed/job_board/js\?for=([a-z0-9_-]+)",
+        f"{careers_url}\n{html}".lower(),
+    )
+    if query_match:
+        return query_match.group(1)
+    candidates = re.findall(
+        r"(?:boards\.greenhouse\.io|boards-api\.greenhouse\.io/v1/boards)/([a-z0-9_-]+)",
+        f"{careers_url}\n{html}".lower(),
+    )
+    if candidates:
+        return candidates[0]
+    parsed = urlparse(careers_url)
+    if parsed.netloc.endswith("greenhouse.io"):
+        parts = [part for part in parsed.path.split("/") if part]
+        if parts:
+            return parts[0]
+    return ""
+
+
+def _extract_lever_company(careers_url: str, html: str) -> str:
+    candidates = re.findall(r"api\.lever\.co/v0/postings/([a-z0-9_-]+)", html.lower())
+    if candidates:
+        return candidates[0]
+    parsed = urlparse(careers_url)
+    if parsed.netloc.endswith("jobs.lever.co"):
+        parts = [part for part in parsed.path.split("/") if part]
+        if parts:
+            return parts[0]
+    return ""
+
+
+def _extract_ashby_company(careers_url: str, html: str) -> str:
+    candidates = re.findall(
+        r"api\.ashbyhq\.com/posting-api/job-board/([a-z0-9_-]+)",
+        html.lower(),
+    )
+    if candidates:
+        return candidates[0]
+    parsed = urlparse(careers_url)
+    if parsed.netloc.endswith("ashbyhq.com"):
+        parts = [part for part in parsed.path.split("/") if part]
+        if parts:
+            return parts[-1]
+    return ""
+
+
+def _extract_workday_tenant_site(careers_url: str, html: str) -> str:
+    url_matches = re.findall(
+        r"https://([a-z0-9.-]*myworkdayjobs\.com)/([a-z0-9-/_-]+)",
+        f"{careers_url}\n{html}".lower(),
+    )
+    locale_tokens = {"en-us", "en-gb", "fr-fr", "de-de", "es-es", "ja-jp"}
+    for host, raw_path in url_matches:
+        tenant = host.split(".")[0]
+        segments = [part for part in raw_path.split("/") if part]
+        candidates = [part for part in segments if part not in locale_tokens and part != "login"]
+        if candidates:
+            return f"{host}|{tenant}|{candidates[0]}"
+
+    parsed = urlparse(careers_url)
+    host = parsed.netloc.lower()
+    if host.endswith("myworkdayjobs.com"):
+        tenant = host.split(".")[0]
+        parts = [part for part in parsed.path.split("/") if part]
+        if parts:
+            return f"{tenant}|{parts[0]}"
+    return ""
+
+
+def _extract_smartrecruiters_company(careers_url: str, html: str) -> str:
+    candidates = re.findall(r"smartrecruiters\.com/([a-z0-9_-]+)", f"{careers_url}\n{html}".lower())
+    if candidates:
+        return candidates[0]
+    parsed = urlparse(careers_url)
+    if parsed.netloc.endswith("smartrecruiters.com"):
+        parts = [part for part in parsed.path.split("/") if part]
+        if parts:
+            return parts[0]
+    return ""
+
+
+def _extract_icims_host(careers_url: str, html: str) -> str:
+    candidates = re.findall(
+        r"https?://([a-z0-9.-]*icims\.com)",
+        f"{careers_url}\n{html}".lower(),
+    )
+    if candidates:
+        ranked = sorted(
+            set(candidates),
+            key=lambda host: (
+                0 if ("careers-" in host or host.startswith("jobs.")) else 1,
+                1 if host.startswith("www.icims.com") else 0,
+                host,
+            ),
+        )
+        for host in ranked:
+            if host != "www.icims.com":
+                return host
+        return ranked[0]
+    host = urlparse(careers_url).netloc.lower()
+    if "icims.com" in host:
+        return host
+    return ""
+
+
+def _extract_taleo_site(careers_url: str, html: str) -> str:
+    signal = f"{careers_url}\n{html}"
+    match = re.search(
+        r"https?://([a-z0-9.-]*taleo\.net)/careersection/([a-z0-9_-]+)/jobsearch\.ftl\?[^\"'\s>]*lang=([a-z-]+)(?:[^\"'\s>]*portal=(\d+))?",
+        signal,
+        flags=re.IGNORECASE,
+    )
+    if match:
+        host = match.group(1).lower()
+        section = match.group(2).strip()
+        lang = match.group(3).strip().lower()
+        portal = (match.group(4) or "").strip()
+        if not portal:
+            portal_match = re.search(r"portal=(\d+)", signal, flags=re.IGNORECASE)
+            if portal_match:
+                portal = portal_match.group(1)
+        if portal:
+            return f"{host}|{section}|{lang}|{portal}"
+
+    parsed = urlparse(careers_url)
+    if parsed.netloc.lower().endswith("taleo.net"):
+        section_match = re.search(
+            r"/careersection/([a-z0-9_-]+)/",
+            parsed.path,
+            flags=re.IGNORECASE,
+        )
+        lang_match = re.search(r"(?:^|&)lang=([a-z-]+)", parsed.query, flags=re.IGNORECASE)
+        portal_match = re.search(r"(?:^|&)portal=(\d+)", parsed.query, flags=re.IGNORECASE)
+        if section_match and lang_match and portal_match:
+            return (
+                f"{parsed.netloc.lower()}|{section_match.group(1)}|"
+                f"{lang_match.group(1).lower()}|{portal_match.group(1)}"
+            )
+        if section_match and lang_match:
+            html_portal = re.search(r"portal=(\d+)", html, flags=re.IGNORECASE)
+            if html_portal:
+                return (
+                    f"{parsed.netloc.lower()}|{section_match.group(1)}|"
+                    f"{lang_match.group(1).lower()}|{html_portal.group(1)}"
+                )
+    return ""
+
+
+def _extract_jibe_site(careers_url: str, html: str, final_url: str) -> str:
+    signal = f"{careers_url}\n{final_url}\n{html}"
+    base_match = re.search(r"<base href=\"([^\"]+)\"", html, flags=re.IGNORECASE)
+    has_jibe_marker = "data-jibe-search-version" in signal.lower()
+    if not base_match and not has_jibe_marker:
         return ""
-    return payload.decode("utf-8", errors="ignore")
+    base_url = base_match.group(1).strip().rstrip("/") if base_match else ""
+    if base_url.startswith("/"):
+        root = final_url or careers_url
+        parsed = urlparse(root)
+        if parsed.scheme and parsed.netloc:
+            base_url = f"{parsed.scheme}://{parsed.netloc}"
+    if base_url and "jibeapply" not in base_url and "icims.com" not in base_url:
+        if not has_jibe_marker and "github.careers" not in (final_url or careers_url):
+            return ""
+    client_match = re.search(r'currentClient\":\"([a-z0-9_-]+)\"', html, flags=re.IGNORECASE)
+    client = client_match.group(1).strip() if client_match else _guess_company_slug(careers_url)
+    if not client:
+        return ""
+    ref = final_url or careers_url
+    return f"{base_url}|{client}|{ref}"
+
+
+def _extract_greenhouse_location(item: dict[str, Any], default_location: str) -> str:
+    location = item.get("location", {})
+    if isinstance(location, dict):
+        name = str(location.get("name", "")).strip()
+        if name:
+            return name
+    return default_location
+
+
+def _extract_lever_location(item: dict[str, Any], default_location: str) -> str:
+    categories = item.get("categories", {})
+    if isinstance(categories, dict):
+        location = str(categories.get("location", "")).strip()
+        if location:
+            return location
+    return default_location
+
+
+def _extract_ashby_location(item: dict[str, Any], default_location: str) -> str:
+    location = item.get("location")
+    if isinstance(location, str) and location.strip():
+        return location.strip()
+    location_obj = item.get("locationName")
+    if isinstance(location_obj, str) and location_obj.strip():
+        return location_obj.strip()
+    return default_location
+
+
+def _extract_workday_location(item: dict[str, Any], default_location: str) -> str:
+    location = item.get("locationsText")
+    if isinstance(location, str) and location.strip():
+        return location.strip()
+    locations = item.get("locations")
+    if isinstance(locations, list) and locations:
+        first = locations[0]
+        if isinstance(first, dict):
+            name = str(first.get("displayText", "")).strip()
+            if name:
+                return name
+    return default_location
+
+
+def _extract_smart_location(item: dict[str, Any], default_location: str) -> str:
+    location = item.get("location")
+    if isinstance(location, dict):
+        city = str(location.get("city", "")).strip()
+        region = str(location.get("region", "")).strip()
+        country = str(location.get("country", "")).strip()
+        parts = [part for part in (city, region, country) if part]
+        if parts:
+            return ", ".join(parts)
+    return default_location
+
+
+def _extract_taleo_location(item: dict[str, Any], default_location: str) -> str:
+    columns = item.get("column", [])
+    if isinstance(columns, list) and len(columns) > 1:
+        raw = str(columns[1]).strip()
+        cleaned = _clean_text(raw).strip("[]\" ")
+        if cleaned:
+            return cleaned
+    return default_location
+
+
+def _extract_taleo_description(url: str, timeout_seconds: float) -> str:
+    status, html = _http_get_text(url, timeout_seconds)
+    if status != 200 or not html:
+        return ""
+    text = _extract_posting_text(html)
+    return text[:2600]
 
 
 def _extract_links(html: str) -> list[tuple[str, str]]:
@@ -230,206 +1472,11 @@ def _extract_links(html: str) -> list[tuple[str, str]]:
     )
     links: list[tuple[str, str]] = []
     for href, text in matches:
-        plain_text = re.sub(r"<[^>]+>", " ", text)
-        clean_text = re.sub(r"\s+", " ", unescape(plain_text)).strip()
-        if not href.strip():
-            continue
-        links.append((href.strip(), clean_text))
+        plain = re.sub(r"<[^>]+>", " ", text)
+        clean = re.sub(r"\s+", " ", unescape(plain)).strip()
+        if href.strip():
+            links.append((href.strip(), clean))
     return links
-
-
-def _looks_like_job_url(url: str, label: str) -> bool:
-    parsed = urlparse(url)
-    if parsed.scheme not in {"http", "https"}:
-        return False
-
-    lowered = url.lower()
-    path = parsed.path.lower()
-    lowered_label = label.lower()
-    if any(blocked in lowered for blocked in BLOCKED_JOB_SOURCES):
-        return False
-    segments = [part for part in path.strip("/").split("/") if part]
-    if segments in (["jobs"], ["job"], ["positions"], ["careers", "jobs"]):
-        return False
-    if path.rstrip("/").endswith("/careers/jobs"):
-        return False
-    if parsed.fragment:
-        return False
-    if any(token in path for token in ("/search", "/categories/", "/category/")):
-        return False
-    if any(token in path for token in ("opening_remarks", "/opening-keynote")):
-        return False
-    if any(part in REJECT_PATH_HINTS for part in segments):
-        return False
-    if any(token in lowered for token in REJECT_PATH_HINTS) or any(
-        token in lowered_label for token in REJECT_PATH_HINTS
-    ):
-        return False
-    if any(hint in path for hint in ("/jobs/", "/job/", "/positions/")):
-        return True
-    if any(part in {"jobs", "job", "positions"} for part in segments) and len(segments) >= 3:
-        return True
-    return False
-
-
-def _looks_like_job_hub_url(url: str) -> bool:
-    parsed = urlparse(url)
-    if parsed.scheme not in {"http", "https"}:
-        return False
-    path = parsed.path.lower()
-    if not path or path in {"/", ""}:
-        return False
-    if any(token in path for token in ("blog", "story", "stories", "news", "about")):
-        return False
-    return any(token in path for token in ("/careers", "/jobs", "/job-search", "/search-results"))
-
-
-def _clean_title(label: str) -> str:
-    if not label:
-        return ""
-    normalized = re.sub(r"\s+", " ", label).strip()
-    normalized = re.sub(r"(apply now|learn more|view job)$", "", normalized, flags=re.IGNORECASE)
-    return normalized.strip(" -|")
-
-
-def _looks_placeholder_title(title: str) -> bool:
-    if not title:
-        return True
-    lowered = title.lower()
-    if any(token in lowered for token in ("widgetbundle", "${", "}}", "{{", "[", "]")):
-        return True
-    return len(title.split()) < 2
-
-
-def _extract_title(html: str) -> str:
-    if not html:
-        return ""
-    h1 = re.search(r"<h1[^>]*>(.*?)</h1>", html, flags=re.IGNORECASE | re.DOTALL)
-    if h1:
-        plain = re.sub(r"<[^>]+>", " ", h1.group(1))
-        return re.sub(r"\s+", " ", unescape(plain)).strip()
-    title = re.search(r"<title[^>]*>(.*?)</title>", html, flags=re.IGNORECASE | re.DOTALL)
-    if title:
-        plain = re.sub(r"<[^>]+>", " ", title.group(1))
-        return re.sub(r"\s+", " ", unescape(plain)).strip()
-    return ""
-
-
-def _title_from_url(url: str) -> str:
-    path = urlparse(url).path.strip("/")
-    if not path:
-        return "Software Engineer"
-    segment = path.split("/")[-1]
-    if not segment:
-        return "Software Engineer"
-    segment = segment.replace("-", " ").replace("_", " ")
-    words = [part for part in segment.split() if part]
-    if not words:
-        return "Software Engineer"
-    normalized = " ".join(word.capitalize() for word in words)
-    return normalized[:120]
-
-
-def _extract_posting_text(html: str) -> str:
-    if not html:
-        return ""
-    body = re.sub(r"(?is)<script.*?>.*?</script>", " ", html)
-    body = re.sub(r"(?is)<style.*?>.*?</style>", " ", body)
-    body = re.sub(r"(?is)<[^>]+>", " ", body)
-    body = re.sub(r"\s+", " ", unescape(body)).strip()
-    return body[:3000]
-
-
-def _is_real_job_posting(text: str) -> bool:
-    lowered = text.lower()
-    if len(lowered.split()) < 120:
-        return False
-    responsibility_hints = ("responsibilities", "requirements", "qualifications")
-    apply_hints = ("apply", "job description", "requisition", "job id")
-    if not any(hint in lowered for hint in responsibility_hints):
-        return False
-    if not any(hint in lowered for hint in apply_hints):
-        return False
-    if sum(1 for term in REJECT_PATH_HINTS if term in lowered) > 3:
-        return False
-    return True
-
-
-def _extract_location(text: str, default_location: str) -> str:
-    lowered = text.lower()
-    for marker in ("location:", "locations:", "based in"):
-        idx = lowered.find(marker)
-        if idx >= 0:
-            snippet = text[idx : idx + 120]
-            snippet = re.sub(r"\s+", " ", snippet)
-            return snippet.split(":")[-1].strip(" .,-")[:60] or default_location
-    if "remote" in lowered:
-        return "Remote - US"
-    return default_location
-
-
-def _extract_salary(text: str) -> str:
-    salary_match = re.search(
-        r"(\$[\d,]{2,7}\s*(?:-|to)\s*\$[\d,]{2,7})|(\$[\d,]{2,7}\s*(?:per year|/year|annually))",
-        text,
-        flags=re.IGNORECASE,
-    )
-    return salary_match.group(0) if salary_match else ""
-
-
-def _extract_technologies(text: str) -> list[str]:
-    tech_terms = (
-        "python",
-        "java",
-        "go",
-        "typescript",
-        "aws",
-        "gcp",
-        "azure",
-        "docker",
-        "kubernetes",
-        "postgres",
-        "redis",
-        "kafka",
-        "terraform",
-    )
-    lowered = text.lower()
-    return [term for term in tech_terms if term in lowered]
-
-
-def _build_description(text: str) -> str:
-    snippets = re.split(r"(?<=[.!?])\s+", text)
-    selected = []
-    for sentence in snippets:
-        lowered = sentence.lower()
-        if any(
-            keyword in lowered
-            for keyword in ("responsibil", "require", "qualification", "experience")
-        ):
-            selected.append(sentence.strip())
-        if len(selected) >= 4:
-            break
-    candidate = " ".join(selected) or text
-    return re.sub(r"\s+", " ", candidate).strip()[:2500]
-
-
-def _is_official_company_url(candidate_url: str, careers_url: str) -> bool:
-    parsed_candidate = urlparse(candidate_url)
-    parsed_careers = urlparse(careers_url)
-    host = parsed_candidate.netloc.lower()
-    careers_host = parsed_careers.netloc.lower()
-    if not host or not careers_host:
-        return False
-    if any(blocked in host for blocked in BLOCKED_JOB_SOURCES):
-        return False
-
-    def _base_domain(value: str) -> str:
-        parts = [part for part in value.split(".") if part]
-        if len(parts) >= 2:
-            return ".".join(parts[-2:])
-        return value
-
-    return _base_domain(host) == _base_domain(careers_host)
 
 
 def _extract_job_urls_from_json_ld(html: str, page_url: str) -> list[tuple[str, str]]:
@@ -440,34 +1487,29 @@ def _extract_job_urls_from_json_ld(html: str, page_url: str) -> list[tuple[str, 
     )
     found: list[tuple[str, str]] = []
     for payload in matches:
-        candidate = payload.strip()
-        if not candidate:
-            continue
         try:
-            data = json.loads(candidate)
+            data = json.loads(payload.strip())
         except Exception:
             continue
         for item in _flatten_jsonld(data):
             if not isinstance(item, dict):
                 continue
-            typ = str(item.get("@type", "")).lower()
-            if "jobposting" not in typ:
+            if "jobposting" not in str(item.get("@type", "")).lower():
                 continue
             raw_url = str(item.get("url", "")).strip()
             if not raw_url:
                 continue
-            absolute = urljoin(page_url, raw_url)
-            label = str(item.get("title", "")).strip()
-            found.append((absolute, label))
+            title = str(item.get("title", "")).strip()
+            found.append((urljoin(page_url, raw_url), title))
     return found
 
 
 def _flatten_jsonld(data: object) -> list[object]:
     if isinstance(data, list):
-        flattened: list[object] = []
+        out: list[object] = []
         for item in data:
-            flattened.extend(_flatten_jsonld(item))
-        return flattened
+            out.extend(_flatten_jsonld(item))
+        return out
     if isinstance(data, dict):
         if "@graph" in data:
             return _flatten_jsonld(data.get("@graph"))
@@ -478,66 +1520,379 @@ def _flatten_jsonld(data: object) -> list[object]:
 def _discover_job_urls_from_sitemap(careers_url: str, timeout_seconds: float) -> list[str]:
     parsed = urlparse(careers_url)
     root = f"{parsed.scheme}://{parsed.netloc}"
-    sitemap_candidates: list[str] = []
-    robots = _fetch_html(f"{root}/robots.txt", max(1.5, timeout_seconds))
-    for line in robots.splitlines():
-        if line.lower().startswith("sitemap:"):
-            sitemap_candidates.append(line.split(":", 1)[1].strip())
-    if not sitemap_candidates:
-        sitemap_candidates = [f"{root}/sitemap.xml"]
+    robots_status, robots = _http_get_text(f"{root}/robots.txt", max(timeout_seconds, 1.0))
+    candidates: list[str] = []
 
-    queue = sitemap_candidates[:4]
+    if robots_status == 200:
+        for line in robots.splitlines():
+            if line.lower().startswith("sitemap:"):
+                candidates.append(line.split(":", 1)[1].strip())
+    if not candidates:
+        candidates = [f"{root}/sitemap.xml"]
+
+    queue = candidates[:4]
     visited: set[str] = set()
     urls: list[str] = []
-    while queue and len(visited) < 8:
+
+    while queue and len(visited) < 10:
         sitemap_url = queue.pop(0)
         if sitemap_url in visited:
             continue
         visited.add(sitemap_url)
-        xml_payload = _fetch_html(
-            sitemap_url,
-            max(1.5, timeout_seconds),
-            max_bytes=2_000_000,
-        )
-        if not xml_payload:
+
+        status, xml = _http_get_text(sitemap_url, max(timeout_seconds, 1.0))
+        if status != 200 or not xml:
             continue
-        locs = _extract_xml_locs(xml_payload)
-        for loc in locs[:1500]:
+
+        for loc in _extract_xml_locs(xml)[:2500]:
             lower = loc.lower()
-            if lower.endswith(".xml") and len(queue) < 12:
+            if lower.endswith(".xml") and len(queue) < 20:
                 queue.append(loc)
                 continue
-            if any(token in lower for token in ("/jobs/", "/job/", "/positions/")):
+            if any(token in lower for token in JOB_PATH_HINTS):
                 urls.append(loc)
-            if len(urls) >= 200:
+            if len(urls) >= 250:
                 return urls
     return urls
 
 
 def _extract_xml_locs(payload: str) -> list[str]:
     return [
-        unescape(match.strip())
-        for match in re.findall(r"<loc>(.*?)</loc>", payload, flags=re.IGNORECASE | re.DOTALL)
-        if match.strip()
+        unescape(value.strip())
+        for value in re.findall(r"<loc>(.*?)</loc>", payload, flags=re.IGNORECASE | re.DOTALL)
+        if value.strip()
     ]
 
 
-def _company_priority(company: dict[str, object]) -> tuple[int, str]:
-    careers_url = str(company.get("careers_url", "")).strip().lower()
-    host = urlparse(careers_url).netloc
-    if host.startswith("jobs.") or host.endswith(".jobs"):
-        return (0, host)
-    if "jobs." in host:
-        return (1, host)
-    return (2, host)
+def _looks_like_job_url(url: str, label: str) -> bool:
+    parsed = urlparse(url)
+    if parsed.scheme not in {"http", "https"}:
+        return False
+
+    lowered = url.lower()
+    path = parsed.path.lower()
+    if parsed.fragment:
+        return False
+    if any(token in lowered for token in REJECT_PATH_HINTS):
+        return False
+    if any(token in path for token in ("/search", "/category", "/categories")):
+        return False
+
+    segments = [part for part in path.strip("/").split("/") if part]
+    if segments in (["jobs"], ["job"], ["positions"], ["careers", "jobs"]):
+        return False
+    if any(hint in path for hint in JOB_PATH_HINTS):
+        return True
+    if any(part in {"jobs", "job", "positions"} for part in segments) and len(segments) >= 3:
+        return True
+    if len(segments) >= 2 and segments[0] == "careers":
+        slug = segments[-1]
+        if re.search(r"[a-f0-9]{8,}", slug):
+            return True
+        if any(hint in slug for hint in SOFTWARE_ROLE_HINTS):
+            return True
+        if re.search(
+            r"[a-f0-9]{8}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{12}",
+            slug,
+        ):
+            return True
+
+    lowered_label = label.lower()
+    return any(token in lowered_label for token in ("engineer", "developer", "firmware"))
+
+
+def _looks_like_job_hub_url(url: str) -> bool:
+    parsed = urlparse(url)
+    if parsed.scheme not in {"http", "https"}:
+        return False
+    path = parsed.path.lower()
+    if any(token in path for token in REJECT_PATH_HINTS):
+        return False
+    return any(token in path for token in ("/careers", "/jobs", "/job-search", "/search-results"))
+
+
+def _extract_title(html: str) -> str:
+    h1 = re.search(r"<h1[^>]*>(.*?)</h1>", html, flags=re.IGNORECASE | re.DOTALL)
+    if h1:
+        return _clean_text(h1.group(1))
+    title = re.search(r"<title[^>]*>(.*?)</title>", html, flags=re.IGNORECASE | re.DOTALL)
+    if title:
+        return _clean_text(title.group(1))
+    return ""
+
+
+def _title_from_url(url: str) -> str:
+    path = urlparse(url).path.strip("/")
+    if not path:
+        return "Software Engineer"
+    slug = path.split("/")[-1].replace("-", " ").replace("_", " ")
+    words = [part for part in slug.split() if part]
+    if not words:
+        return "Software Engineer"
+    return " ".join(word.capitalize() for word in words)[:120]
+
+
+def _clean_title(text: str) -> str:
+    clean = _clean_text(text)
+    clean = re.sub(r"(apply now|learn more|view job)$", "", clean, flags=re.IGNORECASE)
+    return clean.strip(" -|")
+
+
+def _extract_posting_text(html: str) -> str:
+    body = re.sub(r"(?is)<script.*?>.*?</script>", " ", html)
+    body = re.sub(r"(?is)<style.*?>.*?</style>", " ", body)
+    body = re.sub(r"(?is)<[^>]+>", " ", body)
+    return re.sub(r"\s+", " ", unescape(body)).strip()[:3500]
+
+
+def _clean_text(text: str) -> str:
+    plain = re.sub(r"(?is)<[^>]+>", " ", text)
+    return re.sub(r"\s+", " ", unescape(plain)).strip()
+
+
+def _extract_location(text: str, default_location: str) -> str:
+    lowered = text.lower()
+    for marker in ("location:", "locations:", "based in"):
+        idx = lowered.find(marker)
+        if idx >= 0:
+            snippet = re.sub(r"\s+", " ", text[idx : idx + 120])
+            candidate = snippet.split(":")[-1].strip(" .,-")[:80]
+            if candidate:
+                return candidate
+    if "remote" in lowered:
+        return "Remote"
+    return default_location
+
+
+def _extract_location_from_posting(html: str, text: str, default_location: str) -> str:
+    candidates: list[str] = []
+    candidates.extend(_extract_locations_from_json_ld(html))
+    candidates.extend(_extract_locations_from_inline_json(html))
+    candidates.extend(_extract_locations_from_meta(html))
+    text_location = _extract_location(text, "")
+    if text_location:
+        candidates.append(text_location)
+
+    for candidate in candidates:
+        normalized = _normalize_location_string(candidate)
+        if normalized:
+            return normalized
+    return default_location
+
+
+def _extract_locations_from_json_ld(html: str) -> list[str]:
+    matches = re.findall(
+        r"<script[^>]+type=[\"']application/ld\+json[\"'][^>]*>(.*?)</script>",
+        html,
+        flags=re.IGNORECASE | re.DOTALL,
+    )
+    out: list[str] = []
+    for payload in matches:
+        try:
+            parsed = json.loads(payload.strip())
+        except Exception:
+            continue
+        for item in _flatten_jsonld(parsed):
+            if not isinstance(item, dict):
+                continue
+            out.extend(_collect_location_candidates(item))
+    return out
+
+
+def _extract_locations_from_inline_json(html: str) -> list[str]:
+    blobs = re.findall(
+        r"(?is)(?:window\.[A-Za-z0-9_.$]+|var\s+[A-Za-z0-9_.$]+)\s*=\s*(\{.*?\});",
+        html,
+    )
+    out: list[str] = []
+    for blob in blobs[:12]:
+        try:
+            parsed = json.loads(blob)
+        except Exception:
+            continue
+        out.extend(_collect_location_candidates(parsed))
+    return out
+
+
+def _extract_locations_from_meta(html: str) -> list[str]:
+    out: list[str] = []
+    meta_values = re.findall(
+        r"<meta[^>]+content=[\"']([^\"']+)[\"'][^>]*>",
+        html,
+        flags=re.IGNORECASE,
+    )
+    for value in meta_values:
+        # Common SEO format: "Role | Warsaw, Poland | Engineering"
+        parts = [part.strip() for part in value.split("|")]
+        for part in parts:
+            if _looks_like_location_phrase(part):
+                out.append(part)
+    return out
+
+
+def _collect_location_candidates(node: Any) -> list[str]:
+    out: list[str] = []
+
+    if isinstance(node, dict):
+        lower_keys = {str(key).lower(): key for key in node.keys()}
+        for key_lower in (
+            "joblocation",
+            "location",
+            "workplacelocation",
+            "primarylocation",
+            "multilocation",
+            "standardised_multi_location",
+            "standardized_multi_location",
+        ):
+            if key_lower in lower_keys:
+                out.extend(_collect_location_candidates(node[lower_keys[key_lower]]))
+
+        if any(key in lower_keys for key in ("addresslocality", "addressregion", "addresscountry")):
+            locality = str(node.get(lower_keys.get("addresslocality", ""), "")).strip()
+            region = str(node.get(lower_keys.get("addressregion", ""), "")).strip()
+            country = str(node.get(lower_keys.get("addresscountry", ""), "")).strip()
+            merged = ", ".join(part for part in (locality, region, country) if part)
+            if merged:
+                out.append(merged)
+
+        for key_lower in (
+            "standardisedmapquerylocation",
+            "standardizedmapquerylocation",
+            "city",
+            "country",
+            "countryname",
+            "state",
+            "statecode",
+            "displaytext",
+            "locationname",
+            "formattedaddress",
+            "name",
+        ):
+            if key_lower in lower_keys:
+                value = node[lower_keys[key_lower]]
+                if isinstance(value, str) and _looks_like_location_phrase(value):
+                    out.append(value)
+
+        for value in node.values():
+            if isinstance(value, dict | list):
+                out.extend(_collect_location_candidates(value))
+
+    elif isinstance(node, list):
+        for item in node:
+            out.extend(_collect_location_candidates(item))
+    elif isinstance(node, str):
+        if _looks_like_location_phrase(node):
+            out.append(node)
+    return out
+
+
+def _looks_like_location_phrase(value: str) -> bool:
+    text = _normalize_location_string(value)
+    if not text:
+        return False
+    lowered = text.lower()
+    if len(text) > 120:
+        return False
+    if any(token in lowered for token in ("job ", "engineer", "apply", "experience", "salary")):
+        return False
+    # Keep broad enough for global cities while avoiding arbitrary text.
+    return bool(re.search(r"[a-z]{2,}", lowered))
+
+
+def _normalize_location_string(value: str) -> str:
+    text = unescape(value or "")
+    text = text.strip().strip("[]{}()\"'")
+    text = re.sub(r"\s+", " ", text)
+    text = re.sub(r"\s*,\s*", ", ", text)
+    text = re.sub(r"^(us|usa|u\.s\.)[-\s]+", "US-", text, flags=re.IGNORECASE)
+    text = re.sub(r"^(ca|canada)[-\s]+", "CA-", text, flags=re.IGNORECASE)
+    text = text.strip(" .,-")
+    if not text:
+        return ""
+    if len(text) > 120:
+        return ""
+    return text
+
+
+def _extract_salary(text: str) -> str:
+    match = re.search(
+        r"(\$[\d,]{2,7}\s*(?:-|to)\s*\$[\d,]{2,7})"
+        r"|(\$[\d,]{2,7}\s*(?:per year|/year|annually))",
+        text,
+        flags=re.IGNORECASE,
+    )
+    return match.group(0) if match else ""
+
+
+def _extract_technologies(text: str) -> list[str]:
+    lowered = text.lower()
+    found: list[str] = []
+    for skill in sorted(SKILL_VOCABULARY):
+        if " " in skill:
+            if skill in lowered:
+                found.append(skill)
+            continue
+        if re.search(rf"\\b{re.escape(skill)}\\b", lowered):
+            found.append(skill)
+    return found
+
+
+def _guess_work_type(text: str, default_work_type: str) -> str:
+    lowered = text.lower()
+    if "remote" in lowered:
+        return "remote"
+    if "hybrid" in lowered:
+        return "hybrid"
+    if "onsite" in lowered or "on-site" in lowered:
+        return "onsite"
+    return default_work_type
+
+
+def _is_same_or_linked_domain(candidate_url: str, careers_url: str) -> bool:
+    candidate_host = urlparse(candidate_url).netloc.lower()
+    careers_host = urlparse(careers_url).netloc.lower()
+    if not candidate_host or not careers_host:
+        return False
+
+    if any(hint in candidate_host for hint in ATS_DOMAIN_HINTS):
+        return True
+
+    return _base_domain(candidate_host) == _base_domain(careers_host)
+
+
+def _base_domain(host: str) -> str:
+    parts = [part for part in host.split(".") if part]
+    if len(parts) >= 2:
+        return ".".join(parts[-2:])
+    return host
+
+
+def _prioritized_companies(companies: list[dict[str, object]]) -> list[dict[str, object]]:
+    return list(companies)
+
+
+def _effective_careers_url(company_name: str, configured_url: str) -> str:
+    override = CAREERS_URL_OVERRIDES.get(company_name)
+    return override or configured_url
+
+
+def _dedupe_jobs(jobs: list[dict[str, object]]) -> list[dict[str, object]]:
+    out: list[dict[str, object]] = []
+    seen: set[str] = set()
+    for job in jobs:
+        url = str(job.get("job_url", job.get("job_link", ""))).strip()
+        if not url or url in seen:
+            continue
+        seen.add(url)
+        out.append(job)
+    return out
 
 
 def _write_cache(cache_path: str, jobs: list[dict[str, object]]) -> None:
     try:
         path = Path(cache_path)
         path.parent.mkdir(parents=True, exist_ok=True)
-        payload = {"jobs": jobs[:50]}
-        path.write_text(json.dumps(payload), encoding="utf-8")
+        path.write_text(json.dumps({"jobs": jobs[:80]}), encoding="utf-8")
     except Exception:
         return
 
@@ -556,14 +1911,3 @@ def _read_cache(cache_path: str | None) -> list[dict[str, object]]:
     except Exception:
         return []
     return []
-
-
-def _guess_work_type(title: str, default_work_type: str) -> str:
-    lowered = title.lower()
-    if "remote" in lowered:
-        return "remote"
-    if "hybrid" in lowered:
-        return "hybrid"
-    if "onsite" in lowered or "on-site" in lowered:
-        return "onsite"
-    return default_work_type

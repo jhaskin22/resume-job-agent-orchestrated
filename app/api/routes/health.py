@@ -1,10 +1,10 @@
 from fastapi import APIRouter
 
-from app.services.health import health_payload
+from app.core.config import settings
 
 router = APIRouter()
 
 
 @router.get("/health")
 def health() -> dict[str, str]:
-    return health_payload()
+    return {"status": "ok", "app_name": settings.app_name}

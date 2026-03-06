@@ -1,0 +1,22 @@
+{
+  "locations": [
+    {"canonical": "dallas, texas", "lat": 32.7767, "lon": -96.7970, "metros": ["dfw"], "aliases": ["dallas", "dallas tx", "dallas, tx"]},
+    {"canonical": "fort worth, texas", "lat": 32.7555, "lon": -97.3308, "metros": ["dfw"], "aliases": ["fort worth", "fort worth tx", "fort worth, tx"]},
+    {"canonical": "arlington, texas", "lat": 32.7357, "lon": -97.1081, "metros": ["dfw"], "aliases": ["arlington", "arlington tx", "arlington, tx"]},
+    {"canonical": "plano, texas", "lat": 33.0198, "lon": -96.6989, "metros": ["dfw"], "aliases": ["plano", "plano tx", "plano, tx"]},
+    {"canonical": "irving, texas", "lat": 32.8140, "lon": -96.9489, "metros": ["dfw"], "aliases": ["irving", "irving tx", "irving, tx"]},
+    {"canonical": "richardson, texas", "lat": 32.9483, "lon": -96.7299, "metros": ["dfw"], "aliases": ["richardson", "richardson tx", "richardson, tx"]},
+    {"canonical": "hurst, texas", "lat": 32.8235, "lon": -97.1706, "metros": ["dfw"], "aliases": ["hurst", "hurst tx", "hurst, tx"]},
+    {"canonical": "grapevine, texas", "lat": 32.9343, "lon": -97.0781, "metros": ["dfw"], "aliases": ["grapevine", "grapevine tx", "grapevine, tx"]},
+    {"canonical": "euless, texas", "lat": 32.8371, "lon": -97.0819, "metros": ["dfw"], "aliases": ["euless", "euless tx", "euless, tx"]},
+    {"canonical": "bedford, texas", "lat": 32.8440, "lon": -97.1431, "metros": ["dfw"], "aliases": ["bedford", "bedford tx", "bedford, tx"]},
+    {"canonical": "frisco, texas", "lat": 33.1507, "lon": -96.8236, "metros": ["dfw"], "aliases": ["frisco", "frisco tx", "frisco, tx"]},
+    {"canonical": "mckinney, texas", "lat": 33.1972, "lon": -96.6398, "metros": ["dfw"], "aliases": ["mckinney", "mckinney tx", "mckinney, tx"]},
+    {"canonical": "allen, texas", "lat": 33.1032, "lon": -96.6706, "metros": ["dfw"], "aliases": ["allen", "allen tx", "allen, tx"]},
+    {"canonical": "carrollton, texas", "lat": 32.9756, "lon": -96.8899, "metros": ["dfw"], "aliases": ["carrollton", "carrollton tx", "carrollton, tx"]},
+    {"canonical": "farmers branch, texas", "lat": 32.9265, "lon": -96.8961, "metros": ["dfw"], "aliases": ["farmers branch", "farmers branch tx", "farmers branch, tx"]},
+    {"canonical": "grand prairie, texas", "lat": 32.7459, "lon": -96.9978, "metros": ["dfw"], "aliases": ["grand prairie", "grand prairie tx", "grand prairie, tx"]},
+    {"canonical": "garland, texas", "lat": 32.9126, "lon": -96.6389, "metros": ["dfw"], "aliases": ["garland", "garland tx", "garland, tx"]},
+    {"canonical": "north richland hills, texas", "lat": 32.8343, "lon": -97.2289, "metros": ["dfw"], "aliases": ["north richland hills", "nrh", "north richland hills tx", "north richland hills, tx"]}
+  ]
+}

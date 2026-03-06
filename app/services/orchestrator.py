@@ -1,11 +1,11 @@
 from __future__ import annotations
 
 from pathlib import Path
+from uuid import uuid4
 
 from app.core.config import settings
 from app.core.config_loader import load_yaml
-from app.models.api import RunWorkflowResponse, WorkflowDiagnostics
-from app.models.tile import JobMatchTile
+from app.models.schemas import JobMatchTile, RunWorkflowResponse, WorkflowDiagnostics
 from app.workflow.graph import build_workflow
 from app.workflow.io import persist_uploaded_resume
 from app.workflow.nodes import WorkflowNodes
@@ -24,13 +24,21 @@ class ResumeJobOrchestrator:
         self._nodes = WorkflowNodes(workflow_config, prompts_config, generated_resume_dir)
         self._graph = build_workflow(self._nodes, workflow_config)
 
-    def run(self, resume_filename: str, resume_file_bytes: bytes) -> RunWorkflowResponse:
+    def run(
+        self,
+        resume_filename: str,
+        resume_file_bytes: bytes,
+        *,
+        run_id: str | None = None,
+    ) -> RunWorkflowResponse:
+        effective_run_id = run_id or str(uuid4())
         uploaded_path = persist_uploaded_resume(
             payload=resume_file_bytes,
             filename=resume_filename,
             upload_dir=settings.uploaded_resume_dir,
         )
         initial_state: WorkflowState = {
+            "run_id": effective_run_id,
             "resume_filename": resume_filename,
             "uploaded_resume_path": str(uploaded_path),
             "resume_file_bytes": resume_file_bytes,
@@ -49,7 +57,7 @@ class ResumeJobOrchestrator:
             verification=dict(final_state.get("verification", {})),
             errors=list(final_state.get("errors", [])),
         )
-        return RunWorkflowResponse(tiles=tiles, diagnostics=diagnostics)
+        return RunWorkflowResponse(run_id=effective_run_id, tiles=tiles, diagnostics=diagnostics)
 
 
 def generated_resume_path(filename: str) -> Path:

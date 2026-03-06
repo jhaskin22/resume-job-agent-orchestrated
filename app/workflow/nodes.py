@@ -7,10 +7,11 @@ from pathlib import Path
 from typing import Any
 from urllib.parse import urlparse
 
-from app.models.tile import JobMatchTile
+from app.models.schemas import JobMatchTile
 from app.tools.ats import evaluate_ats_score
 from app.tools.job_discovery import DiscoveryConfig, discover_jobs
 from app.tools.job_parsing import parse_job_details
+from app.tools.location_resolver import LocationResolver
 from app.tools.resume import parse_resume_sections
 from app.tools.scoring import score_jobs
 from app.verification.checks import (
@@ -59,6 +60,8 @@ class WorkflowNodes:
         self.workflow_config = workflow_config
         self.prompts_config = prompts_config
         self.generated_resume_dir = generated_resume_dir
+        location_cfg = self.workflow_config.get("job_discovery", {}).get("location_preferences", {})
+        self.location_resolver = LocationResolver(location_cfg)
 
     def _resume_parser_keywords(self) -> tuple[list[str], list[str], list[str]]:
         parser_cfg = self.workflow_config.get("resume_parsing", {})
@@ -95,9 +98,6 @@ class WorkflowNodes:
             "localhost",
             "127.0.0.1",
             "test",
-            "greenhouse",
-            "lever",
-            "ashby",
             "linkedin",
             "indeed",
             "wellfound",
@@ -113,25 +113,44 @@ class WorkflowNodes:
             company_host = urlparse(company_url).netloc
             if company_host:
                 company_hosts.add(company_host)
-        allowed_board_hosts = {"boards.greenhouse.io", "jobs.lever.co", "jobs.ashbyhq.com"}
+        allowed_board_hosts = {
+            "boards.greenhouse.io",
+            "jobs.lever.co",
+            "jobs.ashbyhq.com",
+            "myworkdayjobs.com",
+            "smartrecruiters.com",
+            "icims.com",
+            "taleo.net",
+        }
         if host not in allowed_board_hosts and not any(host.endswith(h) for h in company_hosts):
-            return False
-        if not any(token in url for token in ("/jobs/", "/job/", "/positions/", "/opening")):
+            if not any(host.endswith(board_host) for board_host in allowed_board_hosts):
+                return False
+        source_provider = str(job.get("source_provider", "")).strip().lower()
+        if source_provider not in {
+            "greenhouse",
+            "lever",
+            "ashby",
+            "workday",
+            "smartrecruiters",
+            "icims",
+            "taleo",
+        } and not any(token in url for token in ("/jobs/", "/job/", "/positions/", "/opening")):
             return False
         description_words = len(str(job.get("description", "")).split())
         return description_words >= 20
 
     def _run_discovery(self, timeout_seconds: float, use_fallback: bool) -> list[dict[str, Any]]:
         discovery_cfg = self.workflow_config.get("job_discovery", {})
-        max_jobs = int(self.workflow_config["nodes"]["job_discovery"]["max_jobs"])
         discovered = discover_jobs(
             DiscoveryConfig(
                 companies=[dict(item) for item in discovery_cfg.get("companies", [])],
-                max_jobs=max_jobs,
+                max_jobs=None,
                 timeout_seconds=timeout_seconds,
                 fallback_jobs=[dict(item) for item in discovery_cfg.get("fallback_jobs", [])],
                 use_fallback=use_fallback,
                 cache_path=str(Path("var/discovery_cache.json")),
+                max_jobs_per_company=int(discovery_cfg.get("max_jobs_per_company", 0)),
+                global_budget_seconds=float(discovery_cfg.get("global_budget_seconds", 0)),
             )
         )
         normalized: list[dict[str, Any]] = []
@@ -150,7 +169,11 @@ class WorkflowNodes:
                     "job_link": str(job.get("job_link") or link),
                 }
             )
-        return normalized
+        preferred = [job for job in normalized if self._matches_location_preference(job)]
+        return preferred
+
+    def _matches_location_preference(self, job: dict[str, Any]) -> bool:
+        return self.location_resolver.matches_preference(job)
 
     def _repair_count(self, state: WorkflowState, stage: str) -> int:
         repair_counts = state.setdefault("repair_counts", {})
@@ -433,18 +456,49 @@ class WorkflowNodes:
 
     def job_scoring(self, state: WorkflowState) -> dict[str, Any]:
         top_k = int(self.workflow_config["nodes"]["job_scoring"]["top_k"])
+        min_score = float(self.workflow_config["nodes"]["job_scoring"]["min_match_score"])
         parsed_resume = dict(state.get("parsed_resume", {}))
         discovered_jobs = [dict(item) for item in state.get("discovered_jobs", [])]
         parsed_jobs_map = {
             str(item.get("job_link", "")): dict(item) for item in state.get("parsed_jobs", [])
         }
+        scoring_top_k = 0 if top_k <= 0 else max(top_k, len(discovered_jobs))
         scored = score_jobs(
             parsed_resume,
             discovered_jobs,
             parsed_jobs=parsed_jobs_map,
-            top_k=top_k,
+            top_k=scoring_top_k,
         )
+        scored = [item for item in scored if float(item.get("match_score", 0.0)) >= min_score]
+        scored = self._diversify_companies(scored)
+        if top_k > 0:
+            scored = scored[:top_k]
         return {"scored_jobs": scored}
+
+    def _diversify_companies(self, jobs: list[dict[str, Any]]) -> list[dict[str, Any]]:
+        if not jobs:
+            return jobs
+        top_k = int(self.workflow_config["nodes"]["job_scoring"]["top_k"])
+        max_per_company = int(
+            self.workflow_config["nodes"]["job_scoring"].get("max_per_company", 2)
+        )
+        if max_per_company <= 0:
+            if top_k <= 0:
+                return jobs
+            return jobs[:top_k]
+
+        output: list[dict[str, Any]] = []
+        company_counts: dict[str, int] = {}
+        for job in jobs:
+            company = str(job.get("company", "")).strip().lower() or "unknown"
+            used = company_counts.get(company, 0)
+            if used >= max_per_company:
+                continue
+            output.append(job)
+            company_counts[company] = used + 1
+            if top_k > 0 and len(output) >= top_k:
+                break
+        return output
 
     def verify_job_scoring(self, state: WorkflowState) -> dict[str, Any]:
         jobs = state.get("scored_jobs", [])
@@ -609,6 +663,7 @@ class WorkflowNodes:
         return {"scored_jobs": repaired}
 
     def tile_construction(self, state: WorkflowState) -> dict[str, Any]:
+        run_id = str(state.get("run_id", "")).strip()
         tiles: list[dict[str, Any]] = []
 
         for job in state.get("scored_jobs", []):
@@ -619,6 +674,7 @@ class WorkflowNodes:
                 f"{job['resume_alignment']:.1f}, and ATS score {job['ats_score']:.1f}."
             )
             tile = JobMatchTile(
+                run_id=run_id,
                 company=str(job["company"]),
                 title=str(job["title"]),
                 location=str(job["location"]),
@@ -644,11 +700,13 @@ class WorkflowNodes:
         return self._set_verification(state, "tile_construction", True)
 
     def repair_tile_construction(self, state: WorkflowState) -> dict[str, Any]:
+        run_id = str(state.get("run_id", "")).strip()
         self._inc_repair_count(state, "tile_construction")
         repaired: list[dict[str, Any]] = []
 
         for tile in state.get("tiles", []):
             candidate = {
+                "run_id": tile.get("run_id") or run_id,
                 "company": tile.get("company") or "Unknown Company",
                 "title": tile.get("title") or "Unknown Title",
                 "location": tile.get("location") or "Unknown",

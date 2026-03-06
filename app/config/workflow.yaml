@@ -6,13 +6,14 @@ nodes:
     min_text_chars: 40
     min_populated_fields: 2
   job_discovery:
-    max_jobs: 8
+    max_jobs: 120
     min_job_count: 1
     max_discovery_retries: 1
   job_parsing: {}
   job_scoring:
     min_match_score: 0
-    top_k: 6
+    top_k: 0
+    max_per_company: 0
   resume_generation:
     min_resume_bytes: 180
     max_bullet_rewrites: 2
@@ -68,7 +69,20 @@ resume_parsing:
     - Technical Lead
 
 job_discovery:
-  fetch_timeout_seconds: 1.5
+  fetch_timeout_seconds: 4.0
+  max_jobs_per_company: 0
+  global_budget_seconds: 0
+  location_preferences:
+    enabled: true
+    allowed_work_types: ["remote", "hybrid"]
+    metro: "dfw"
+    dfw_center: [32.8998, -97.0403]
+    dfw_radius_miles: 45
+    registry_path: "app/config/location_registry.json"
+    geocode_cache_path: "var/location_geocode_cache.json"
+    unknown_queue_path: "var/location_unknown_queue.json"
+    location_hints:
+      ["dallas", "fort worth", "plano", "richardson", "arlington", "hurst", "dfw"]
   companies:
     - name: "Stripe"
       careers_url: "https://careers.stripe.com/jobs"
@@ -95,21 +109,11 @@ job_discovery:
       default_location: "United States"
       default_work_type: "hybrid"
       job_link_keywords: ["job", "position", "opening", "mongodb.com/careers"]
-    - name: "HashiCorp"
-      careers_url: "https://www.hashicorp.com/en/careers/open-positions"
-      default_location: "United States"
-      default_work_type: "remote"
-      job_link_keywords: ["job", "position", "opening", "hashicorp.com/careers"]
     - name: "Automattic"
       careers_url: "https://automattic.com/work-with-us/"
       default_location: "Remote - US"
       default_work_type: "remote"
       job_link_keywords: ["job", "position", "opening", "automattic.com"]
-    - name: "Shopify"
-      careers_url: "https://www.shopify.com/careers"
-      default_location: "United States"
-      default_work_type: "remote"
-      job_link_keywords: ["job", "position", "opening", "shopify.com/careers"]
     - name: "NVIDIA"
       careers_url: "https://www.nvidia.com/en-us/about-nvidia/careers/"
       default_location: "United States"
@@ -125,11 +129,6 @@ job_discovery:
       default_location: "United States"
       default_work_type: "remote"
       job_link_keywords: ["job", "position", "opening", "fastly.com"]
-    - name: "DigitalOcean"
-      careers_url: "https://www.digitalocean.com/careers"
-      default_location: "United States"
-      default_work_type: "remote"
-      job_link_keywords: ["job", "position", "opening", "digitalocean.com"]
     - name: "Vercel"
       careers_url: "https://vercel.com/careers"
       default_location: "United States"

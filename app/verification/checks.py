@@ -8,7 +8,7 @@ from urllib.request import Request, urlopen
 
 from docx import Document
 
-from app.models.tile import JobMatchTile
+from app.models.schemas import JobMatchTile
 
 
 def verify_parsed_resume(parsed_resume: dict[str, Any], min_items: int) -> tuple[bool, str]:
@@ -177,9 +177,6 @@ def _is_valid_http_url(url: str) -> bool:
         "127.0.0.1",
         "test",
         ".test",
-        "greenhouse",
-        "lever",
-        "ashby",
         "linkedin",
         "indeed",
         "wellfound",
@@ -193,6 +190,19 @@ def _is_valid_http_url(url: str) -> bool:
 def _looks_like_posting_url(url: str) -> bool:
     parsed = urlparse(url)
     lowered = url.lower()
+    if any(
+        token in lowered
+        for token in (
+            "greenhouse",
+            "lever.co",
+            "ashbyhq",
+            "myworkdayjobs",
+            "smartrecruiters",
+            "icims.com",
+            "taleo.net",
+        )
+    ):
+        return parsed.scheme in {"http", "https"} and bool(parsed.netloc) and len(parsed.path) > 1
     if any(token in lowered for token in ("about", "team", "culture", "benefits", "company")):
         return False
     path = parsed.path.lower().strip("/")
