@@ -1,5 +1,6 @@
 workflow:
   max_repair_attempts: 2
+  inline_resume_generation: false
 
 nodes:
   resume_parsing:
@@ -122,6 +123,11 @@ resume_parsing:
 
 job_discovery:
   fetch_timeout_seconds: 4.0
+  company_workers: 6
+  http_cache_enabled: true
+  http_cache_ttl_seconds: 180.0
+  salary_backfill_max_lookups: 60
+  salary_backfill_workers: 8
   max_jobs_per_company: 0
   global_budget_seconds: 0
   location_preferences:

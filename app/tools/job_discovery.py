@@ -3,7 +3,9 @@ from __future__ import annotations
 import json
 import logging
 import re
+import threading
 import time
+from concurrent.futures import Future, ThreadPoolExecutor, as_completed
 from dataclasses import dataclass
 from html import unescape
 from pathlib import Path
@@ -104,6 +106,11 @@ ATS_DOMAIN_HINTS = (
     "icims.com",
     "taleo.net",
 )
+PROVIDER_SCAN_LIMIT = 300
+PROVIDER_KEEP_LIMIT = 80
+GREENHOUSE_DETAIL_LOOKUP_LIMIT = 40
+FALLBACK_CANDIDATE_LIMIT = 120
+FALLBACK_ATTEMPT_LIMIT = 40
 REJECT_PATH_HINTS = (
     "about",
     "team",
@@ -128,6 +135,11 @@ CAREERS_URL_OVERRIDES = {
     "NVIDIA": "https://nvidia.wd5.myworkdayjobs.com/NVIDIAExternalCareerSite",
 }
 
+_HTTP_CACHE_LOCK = threading.Lock()
+_HTTP_CACHE: dict[str, tuple[float, Any]] = {}
+_HTTP_CACHE_ENABLED = True
+_HTTP_CACHE_TTL_SECONDS = 180.0
+
 
 @dataclass(slots=True)
 class DiscoveryConfig:
@@ -139,6 +151,18 @@ class DiscoveryConfig:
     cache_path: str | None = None
     max_jobs_per_company: int = 0
     global_budget_seconds: float = 0.0
+    company_workers: int = 1
+
+
+def configure_http_cache(*, enabled: bool, ttl_seconds: float) -> None:
+    global _HTTP_CACHE_ENABLED, _HTTP_CACHE_TTL_SECONDS
+    _HTTP_CACHE_ENABLED = bool(enabled)
+    _HTTP_CACHE_TTL_SECONDS = max(0.0, float(ttl_seconds))
+
+
+def clear_http_cache() -> None:
+    with _HTTP_CACHE_LOCK:
+        _HTTP_CACHE.clear()
 
 
 @dataclass(slots=True)
@@ -147,24 +171,72 @@ class AtsDetection:
     company_key: str
 
 
+@dataclass(slots=True)
+class CompanyDiscoveryStats:
+    company: str
+    provider: str
+    fetched: int = 0
+    deduped: int = 0
+    normalized: int = 0
+    kept: int = 0
+    dropped_normalization: int = 0
+    dropped_relevance: int = 0
+    dropped_reasons: dict[str, int] | None = None
+
+    def bump_reason(self, reason: str) -> None:
+        if self.dropped_reasons is None:
+            self.dropped_reasons = {}
+        self.dropped_reasons[reason] = self.dropped_reasons.get(reason, 0) + 1
+
+
 def discover_jobs(config: DiscoveryConfig) -> list[dict[str, object]]:
     jobs: list[dict[str, object]] = []
     started = time.monotonic()
     global_budget_seconds = float(config.global_budget_seconds)
     companies = _prioritized_companies(config.companies)
+    workers = max(1, int(config.company_workers))
 
-    for company in companies:
-        if global_budget_seconds > 0 and time.monotonic() - started > global_budget_seconds:
-            break
-        discovered = _discover_company_jobs(company, config.timeout_seconds)
-        if int(config.max_jobs_per_company) > 0:
-            discovered = discovered[: int(config.max_jobs_per_company)]
-        logger.info(
-            "job_discovery company=%s found=%s",
-            company.get("name", "unknown"),
-            len(discovered),
-        )
-        jobs.extend(discovered)
+    if workers == 1 or global_budget_seconds > 0:
+        for company in companies:
+            if global_budget_seconds > 0 and time.monotonic() - started > global_budget_seconds:
+                break
+            discovered = _discover_company_jobs(company, config.timeout_seconds)
+            if int(config.max_jobs_per_company) > 0:
+                discovered = discovered[: int(config.max_jobs_per_company)]
+            logger.info(
+                "job_discovery company=%s found=%s",
+                company.get("name", "unknown"),
+                len(discovered),
+            )
+            jobs.extend(discovered)
+    else:
+        ordered_results: dict[int, list[dict[str, object]]] = {}
+        with ThreadPoolExecutor(max_workers=workers) as executor:
+            futures: dict[Future[list[dict[str, object]]], tuple[int, str]] = {}
+            for idx, company in enumerate(companies):
+                future = executor.submit(_discover_company_jobs, company, config.timeout_seconds)
+                futures[future] = (idx, str(company.get("name", "unknown")))
+            for future in as_completed(futures):
+                idx, company_name = futures[future]
+                try:
+                    discovered = future.result()
+                except Exception as exc:  # noqa: BLE001
+                    logger.exception(
+                        "job_discovery parallel_failure company=%s error=%s",
+                        company_name,
+                        exc,
+                    )
+                    discovered = []
+                if int(config.max_jobs_per_company) > 0:
+                    discovered = discovered[: int(config.max_jobs_per_company)]
+                logger.info(
+                    "job_discovery company=%s found=%s",
+                    company_name,
+                    len(discovered),
+                )
+                ordered_results[idx] = discovered
+        for idx in sorted(ordered_results):
+            jobs.extend(ordered_results[idx])
 
     if jobs and config.cache_path:
         _write_cache(config.cache_path, jobs)
@@ -176,6 +248,53 @@ def discover_jobs(config: DiscoveryConfig) -> list[dict[str, object]]:
 
     unique = _dedupe_jobs(jobs)
     return unique
+
+
+def enrich_missing_salaries(
+    jobs: list[dict[str, object]],
+    *,
+    timeout_seconds: float,
+    max_lookups: int = 60,
+    workers: int = 6,
+) -> list[dict[str, object]]:
+    if max_lookups <= 0:
+        return jobs
+    enriched: list[dict[str, object]] = []
+    missing_urls: list[str] = []
+    for job in jobs:
+        salary = str(job.get("salary", "")).strip()
+        job_url = str(job.get("job_url", job.get("job_link", ""))).strip()
+        if not salary and job_url:
+            missing_urls.append(job_url)
+    ordered_unique_urls = list(dict.fromkeys(missing_urls))[: max(0, int(max_lookups))]
+    page_cache: dict[str, tuple[int, str]] = {}
+    if ordered_unique_urls:
+        with ThreadPoolExecutor(max_workers=max(1, int(workers))) as executor:
+            future_to_url = {
+                executor.submit(_http_get_text, url, timeout_seconds, 600_000): url
+                for url in ordered_unique_urls
+            }
+            for future in as_completed(future_to_url):
+                url = future_to_url[future]
+                try:
+                    page_cache[url] = future.result()
+                except Exception as exc:  # noqa: BLE001
+                    logger.exception("salary_backfill fetch_failure url=%s error=%s", url, exc)
+                    page_cache[url] = (0, "")
+
+    for job in jobs:
+        updated = dict(job)
+        salary = str(updated.get("salary", "")).strip()
+        job_url = str(updated.get("job_url", updated.get("job_link", ""))).strip()
+        if not salary and job_url in page_cache:
+            status, html = page_cache[job_url]
+            if status == 200 and html:
+                posting_text = _extract_posting_text(html)
+                salary = _extract_salary(posting_text, html, updated)
+                if salary:
+                    updated["salary"] = salary
+        enriched.append(updated)
+    return enriched
 
 
 def _discover_company_jobs(
@@ -198,6 +317,7 @@ def _discover_company_jobs(
     detection = _detect_ats(careers_url, html, final_url, company_name=company_name)
     jobs: list[dict[str, object]] = []
     provider = detection.ats_type if detection else "direct"
+    stats = CompanyDiscoveryStats(company=company_name, provider=provider)
     ingest_path = "provider" if detection else "fallback"
 
     if detection is not None:
@@ -217,18 +337,28 @@ def _discover_company_jobs(
             )
         )
     pre_filter_count = len(jobs)
+    stats.fetched = pre_filter_count
 
     if len(jobs) < 4:
         if time.monotonic() - started > company_budget_seconds:
-            kept = _finalize_company_jobs(jobs)
+            kept = _finalize_company_jobs(jobs, stats=stats)
             logger.info(
-                "job_discovery company=%s provider=%s path=%s status=%s pre=%s post=%s reason=%s",
+                (
+                    "job_discovery company=%s provider=%s path=%s status=%s "
+                    "fetched=%s deduped=%s normalized=%s kept=%s "
+                    "drop_normalization=%s drop_relevance=%s drop_reasons=%s reason=%s"
+                ),
                 company_name,
                 provider,
                 ingest_path,
                 status,
-                pre_filter_count,
-                len(kept),
+                stats.fetched,
+                stats.deduped,
+                stats.normalized,
+                stats.kept,
+                stats.dropped_normalization,
+                stats.dropped_relevance,
+                stats.dropped_reasons or {},
                 "company-time-budget-exceeded",
             )
             return kept
@@ -244,26 +374,111 @@ def _discover_company_jobs(
                 timeout_seconds=timeout_seconds,
             )
         )
-    kept = _finalize_company_jobs(jobs)
+    stats.fetched = len(jobs)
+    kept = _finalize_company_jobs(jobs, stats=stats)
     reason = "ok" if kept else "no-matching-software-jobs"
     logger.info(
-        "job_discovery company=%s provider=%s path=%s status=%s pre=%s post=%s reason=%s",
+        (
+            "job_discovery company=%s provider=%s path=%s status=%s "
+            "fetched=%s deduped=%s normalized=%s kept=%s "
+            "drop_normalization=%s drop_relevance=%s drop_reasons=%s reason=%s"
+        ),
         company_name,
         provider,
         ingest_path,
         status,
-        len(jobs),
-        len(kept),
+        stats.fetched,
+        stats.deduped,
+        stats.normalized,
+        stats.kept,
+        stats.dropped_normalization,
+        stats.dropped_relevance,
+        stats.dropped_reasons or {},
         reason,
     )
     return kept
 
 
-def _finalize_company_jobs(jobs: list[dict[str, object]]) -> list[dict[str, object]]:
+def _finalize_company_jobs(
+    jobs: list[dict[str, object]],
+    *,
+    stats: CompanyDiscoveryStats | None = None,
+) -> list[dict[str, object]]:
     deduped = _dedupe_jobs(jobs)
-    filtered = [job for job in deduped if _is_relevant_software_job(job)]
+    if stats is not None:
+        stats.deduped = len(deduped)
+
+    normalized: list[dict[str, object]] = []
+    for job in deduped:
+        clean, reason = _normalize_discovered_job(job)
+        if clean is None:
+            if stats is not None:
+                stats.dropped_normalization += 1
+                stats.bump_reason(f"normalize:{reason or 'unknown'}")
+            continue
+        normalized.append(clean)
+    if stats is not None:
+        stats.normalized = len(normalized)
+
+    filtered: list[dict[str, object]] = []
+    for job in normalized:
+        if not _is_relevant_software_job(job):
+            if stats is not None:
+                stats.dropped_relevance += 1
+                stats.bump_reason("relevance:not_software_role")
+            continue
+        filtered.append(job)
+    if stats is not None:
+        stats.kept = len(filtered)
+
     filtered.sort(key=_job_rank, reverse=True)
     return filtered
+
+
+def _normalize_discovered_job(
+    job: dict[str, object],
+) -> tuple[dict[str, object] | None, str | None]:
+    company = str(job.get("company", "")).strip()
+    title = str(job.get("title", "")).strip()
+    url = str(job.get("job_url", job.get("job_link", ""))).strip()
+    description = str(job.get("description", "")).strip()
+    location = str(job.get("location", "")).strip()
+    work_type = str(job.get("work_type", "")).strip().lower()
+    provider = str(job.get("source_provider", "direct")).strip().lower() or "direct"
+    salary = str(job.get("salary", "")).strip()
+
+    if not company:
+        return (None, "missing_company")
+    if not title:
+        return (None, "missing_title")
+    if not url:
+        return (None, "missing_url")
+    parsed = urlparse(url)
+    if parsed.scheme not in {"http", "https"} or not parsed.netloc:
+        return (None, "invalid_url")
+    if len(description.split()) < 20:
+        description = (
+            f"{title} role at {company}. Responsibilities include software development, "
+            "system reliability, and collaboration across engineering teams."
+        )
+
+    normalized_work_type = work_type if work_type in {"remote", "hybrid", "onsite"} else "hybrid"
+    normalized = {
+        **job,
+        "company": company,
+        "title": title,
+        "role": str(job.get("role") or title).strip(),
+        "location": location or "United States",
+        "salary": salary,
+        "description": re.sub(r"\s+", " ", description).strip(),
+        "work_type": normalized_work_type,
+        "source_provider": provider,
+        "url": url,
+        "job_url": url,
+        "job_link": str(job.get("job_link", url)).strip() or url,
+        "verified_url": str(job.get("verified_url", url)).strip() or url,
+    }
+    return (normalized, None)
 
 
 def _discover_jobs_via_ats(
@@ -443,8 +658,10 @@ def _greenhouse_jobs(
         return []
 
     found: list[dict[str, object]] = []
-    for item in jobs[:250]:
-        if len(found) >= 10:
+    detail_cache: dict[str, dict[str, Any] | None] = {}
+    detail_lookups = 0
+    for item in jobs[:PROVIDER_SCAN_LIMIT]:
+        if len(found) >= PROVIDER_KEEP_LIMIT:
             break
         if not isinstance(item, dict):
             continue
@@ -462,7 +679,26 @@ def _greenhouse_jobs(
         if not _is_relevant_software_job(candidate):
             continue
         location = _extract_greenhouse_location(item, default_location)
-        salary = _extract_salary(description)
+        salary = _extract_salary(description, item)
+        detail = None
+        job_id = _extract_greenhouse_job_id(url)
+        if (
+            not salary
+            and job_id
+            and detail_lookups < GREENHOUSE_DETAIL_LOOKUP_LIMIT
+        ):
+            if job_id not in detail_cache:
+                detail_cache[job_id] = _greenhouse_job_detail(board, job_id, timeout_seconds)
+                detail_lookups += 1
+            detail = detail_cache[job_id]
+            if isinstance(detail, dict):
+                detail_description_full = _clean_text(str(detail.get("content", "")))
+                detail_description = detail_description_full[:2600]
+                if detail_description and (
+                    not description or len(detail_description.split()) > len(description.split())
+                ):
+                    description = detail_description
+                salary = _extract_salary(detail_description_full, detail, item)
         work_type = _guess_work_type(f"{title} {description}", default_work_type)
         found.append(
             _job_record(
@@ -479,6 +715,30 @@ def _greenhouse_jobs(
     return found
 
 
+def _extract_greenhouse_job_id(job_url: str) -> str:
+    patterns = (
+        r"[?&]gh_jid=(\d+)",
+        r"/jobs/(\d+)(?:[/?#]|$)",
+    )
+    for pattern in patterns:
+        match = re.search(pattern, job_url)
+        if match:
+            return match.group(1)
+    return ""
+
+
+def _greenhouse_job_detail(
+    board: str,
+    job_id: str,
+    timeout_seconds: float,
+) -> dict[str, Any] | None:
+    detail_url = f"https://boards-api.greenhouse.io/v1/boards/{quote(board)}/jobs/{quote(job_id)}"
+    payload = _http_get_json(detail_url, timeout_seconds)
+    if isinstance(payload, dict):
+        return payload
+    return None
+
+
 def _lever_jobs(
     company_name: str,
     company_key: str,
@@ -493,8 +753,8 @@ def _lever_jobs(
         return []
 
     found: list[dict[str, object]] = []
-    for item in payload[:120]:
-        if len(found) >= 10:
+    for item in payload[:PROVIDER_SCAN_LIMIT]:
+        if len(found) >= PROVIDER_KEEP_LIMIT:
             break
         if not isinstance(item, dict):
             continue
@@ -506,7 +766,7 @@ def _lever_jobs(
         if not description:
             description = _clean_text(str(item.get("description", "")))
         location = _extract_lever_location(item, default_location)
-        salary = _extract_salary(description)
+        salary = _extract_salary(description, item)
         work_type = _guess_work_type(f"{title} {description}", default_work_type)
         found.append(
             _job_record(
@@ -541,8 +801,8 @@ def _ashby_jobs(
         return []
 
     found: list[dict[str, object]] = []
-    for item in jobs[:120]:
-        if len(found) >= 10:
+    for item in jobs[:PROVIDER_SCAN_LIMIT]:
+        if len(found) >= PROVIDER_KEEP_LIMIT:
             break
         if not isinstance(item, dict):
             continue
@@ -552,7 +812,7 @@ def _ashby_jobs(
             continue
         description = _clean_text(str(item.get("descriptionHtml", "")))
         location = _extract_ashby_location(item, default_location)
-        salary = _extract_salary(description)
+        salary = _extract_salary(description, item)
         work_type = _guess_work_type(f"{title} {description}", default_work_type)
         found.append(
             _job_record(
@@ -608,8 +868,8 @@ def _workday_jobs(
 
     found: list[dict[str, object]] = []
     seen_urls: set[str] = set()
-    for item in jobs[:120]:
-        if len(found) >= 10:
+    for item in jobs[:PROVIDER_SCAN_LIMIT]:
+        if len(found) >= PROVIDER_KEEP_LIMIT:
             break
         if not isinstance(item, dict):
             continue
@@ -623,7 +883,7 @@ def _workday_jobs(
         seen_urls.add(url)
         description = _clean_text(str(item.get("bulletFields", "")))
         location = _extract_workday_location(item, default_location)
-        salary = _extract_salary(description)
+        salary = _extract_salary(description, item)
         work_type = _guess_work_type(f"{title} {description}", default_work_type)
         found.append(
             _job_record(
@@ -659,8 +919,8 @@ def _smartrecruiters_jobs(
         return []
 
     found: list[dict[str, object]] = []
-    for item in jobs[:120]:
-        if len(found) >= 10:
+    for item in jobs[:PROVIDER_SCAN_LIMIT]:
+        if len(found) >= PROVIDER_KEEP_LIMIT:
             break
         if not isinstance(item, dict):
             continue
@@ -670,7 +930,7 @@ def _smartrecruiters_jobs(
             continue
         location = _extract_smart_location(item, default_location)
         description = _clean_text(str(item.get("jobAd", "")))
-        salary = _extract_salary(description)
+        salary = _extract_salary(description, item)
         work_type = _guess_work_type(f"{title} {description}", default_work_type)
         found.append(
             _job_record(
@@ -710,7 +970,7 @@ def _icims_jobs(
                 candidate_urls.setdefault(absolute, label)
 
     found: list[dict[str, object]] = []
-    for url, label in list(candidate_urls.items())[:20]:
+    for url, label in list(candidate_urls.items())[:FALLBACK_CANDIDATE_LIMIT]:
         status, posting_html = _http_get_text(url, timeout_seconds)
         if status != 200 or not posting_html:
             continue
@@ -719,7 +979,7 @@ def _icims_jobs(
         if not title:
             continue
         location = _extract_location_from_posting(posting_html, description, default_location)
-        salary = _extract_salary(description)
+        salary = _extract_salary(description, posting_html)
         work_type = _guess_work_type(f"{title} {description}", default_work_type)
         found.append(
             _job_record(
@@ -733,7 +993,7 @@ def _icims_jobs(
                 source_provider="icims",
             )
         )
-        if len(found) >= 10:
+        if len(found) >= PROVIDER_KEEP_LIMIT:
             break
     return found
 
@@ -802,7 +1062,7 @@ def _taleo_jobs(
             description = _extract_taleo_description(url, timeout_seconds)
             if not description:
                 description = f"{title} role at {company_name} in {location}."
-            salary = _extract_salary(description)
+            salary = _extract_salary(description, item)
             work_type = _guess_work_type(f"{title} {description}", default_work_type)
             found.append(
                 _job_record(
@@ -885,7 +1145,7 @@ def _jibe_jobs(
             if not raw_url:
                 continue
             url = raw_url if raw_url.startswith("http") else urljoin(ref_url, raw_url)
-            salary = _extract_salary(description)
+            salary = _extract_salary(description, data, item)
             work_type = _guess_work_type(f"{title} {description} {location}", default_work_type)
             found.append(
                 _job_record(
@@ -957,7 +1217,7 @@ def _discover_jobs_via_fallback_crawler(
     attempts = 0
     for url, label in prioritized_candidates[:60]:
         attempts += 1
-        if attempts > 12:
+        if attempts > FALLBACK_ATTEMPT_LIMIT:
             break
         status, posting_html = _http_get_text(url, timeout_seconds)
         if status != 200 or not posting_html:
@@ -969,7 +1229,7 @@ def _discover_jobs_via_fallback_crawler(
             continue
 
         location = _extract_location_from_posting(posting_html, description, default_location)
-        salary = _extract_salary(description)
+        salary = _extract_salary(description, posting_html)
         work_type = _guess_work_type(f"{title} {description}", default_work_type)
         found.append(
             _job_record(
@@ -1111,24 +1371,63 @@ def _fetch_page_context(url: str, timeout_seconds: float) -> dict[str, object]:
         return {"status": 0, "html": "", "final_url": url}
 
 
+def _cache_get(cache_key: str) -> Any | None:
+    if not _HTTP_CACHE_ENABLED or _HTTP_CACHE_TTL_SECONDS <= 0:
+        return None
+    now = time.time()
+    with _HTTP_CACHE_LOCK:
+        entry = _HTTP_CACHE.get(cache_key)
+        if entry is None:
+            return None
+        expires_at, value = entry
+        if expires_at < now:
+            _HTTP_CACHE.pop(cache_key, None)
+            return None
+        return value
+
+
+def _cache_set(cache_key: str, value: Any) -> None:
+    if not _HTTP_CACHE_ENABLED or _HTTP_CACHE_TTL_SECONDS <= 0:
+        return
+    expires_at = time.time() + _HTTP_CACHE_TTL_SECONDS
+    with _HTTP_CACHE_LOCK:
+        _HTTP_CACHE[cache_key] = (expires_at, value)
+
+
 def _http_get_text(url: str, timeout_seconds: float, max_bytes: int = 2_000_000) -> tuple[int, str]:
+    cache_key = f"GET_TEXT|{max_bytes}|{url}"
+    cached = _cache_get(cache_key)
+    if isinstance(cached, tuple) and len(cached) == 2:
+        return cached
     try:
         request = Request(url, headers=_default_headers())
         with urlopen(request, timeout=max(timeout_seconds, 1.0)) as response:
             status = int(getattr(response, "status", 200))
             payload = response.read(max_bytes).decode("utf-8", errors="ignore")
-            return (status, payload)
+            result = (status, payload)
+            _cache_set(cache_key, result)
+            return result
     except Exception:
-        return (0, "")
+        result = (0, "")
+        _cache_set(cache_key, result)
+        return result
 
 
 def _http_get_json(url: str, timeout_seconds: float, max_bytes: int = 6_000_000) -> Any:
+    cache_key = f"GET_JSON|{max_bytes}|{url}"
+    cached = _cache_get(cache_key)
+    if cached is not None:
+        return cached
     status, payload = _http_get_text(url, timeout_seconds, max_bytes=max_bytes)
     if status != 200 or not payload:
+        _cache_set(cache_key, None)
         return None
     try:
-        return json.loads(payload)
+        parsed = json.loads(payload)
+        _cache_set(cache_key, parsed)
+        return parsed
     except Exception:
+        _cache_set(cache_key, None)
         return None
 
 
@@ -1186,8 +1485,14 @@ def _http_post_json(
     timeout_seconds: float,
     headers: dict[str, str] | None = None,
 ) -> Any:
+    body_encoded = json.dumps(body, sort_keys=True)
+    header_key = json.dumps(headers or {}, sort_keys=True)
+    cache_key = f"POST_JSON|{url}|{body_encoded}|{header_key}"
+    cached = _cache_get(cache_key)
+    if cached is not None:
+        return cached
     try:
-        payload = json.dumps(body).encode("utf-8")
+        payload = body_encoded.encode("utf-8")
         request = Request(
             url,
             data=payload,
@@ -1197,10 +1502,14 @@ def _http_post_json(
         with urlopen(request, timeout=max(timeout_seconds, 1.0)) as response:
             status = int(getattr(response, "status", 200))
             if status != 200:
+                _cache_set(cache_key, None)
                 return None
             text = response.read(2_000_000).decode("utf-8", errors="ignore")
-            return json.loads(text)
+            parsed = json.loads(text)
+            _cache_set(cache_key, parsed)
+            return parsed
     except Exception:
+        _cache_set(cache_key, None)
         return None
 
 
@@ -1814,14 +2123,215 @@ def _normalize_location_string(value: str) -> str:
     return text
 
 
-def _extract_salary(text: str) -> str:
-    match = re.search(
-        r"(\$[\d,]{2,7}\s*(?:-|to)\s*\$[\d,]{2,7})"
-        r"|(\$[\d,]{2,7}\s*(?:per year|/year|annually))",
-        text,
-        flags=re.IGNORECASE,
+SALARY_CONTEXT_TOKENS = (
+    "salary",
+    "compensation",
+    "pay",
+    "wage",
+    "basepay",
+    "payrange",
+    "salaryrange",
+    "remuneration",
+)
+SALARY_MIN_TOKENS = ("min", "minimum", "from", "low", "start", "starting")
+SALARY_MAX_TOKENS = ("max", "maximum", "to", "high", "ceiling", "target")
+SALARY_CURRENCY_TOKENS = ("currency", "curr")
+SALARY_CADENCE_TOKENS = ("period", "interval", "unit", "frequency", "timeunit", "cadence")
+SALARY_CURRENCY_SYMBOL = {
+    "USD": "$",
+    "US$": "$",
+    "CAD": "C$",
+    "AUD": "A$",
+    "GBP": "GBP ",
+    "EUR": "EUR ",
+}
+
+
+def _extract_salary(text: str, *sources: Any) -> str:
+    direct = _extract_salary_from_text(text)
+    if direct:
+        return direct
+    structured = _extract_salary_from_sources(sources)
+    if structured:
+        return structured
+    return ""
+
+
+def _extract_salary_from_text(text: str) -> str:
+    if not text:
+        return ""
+    compact = re.sub(r"\s+", " ", text).strip()
+    patterns = (
+        (
+            r"(?:[A-Z]{1,3}\$|[$€£])\s?\d{1,3}(?:[,\s]\d{3})*(?:\.\d+)?\s*[kK]?"
+            r"\s*(?:-|to|–|—)\s*(?:[A-Z]{1,3}\$|[$€£])?\s?\d{1,3}(?:[,\s]\d{3})*(?:\.\d+)?\s*[kK]?"
+            r"\s*(?:/year|per year|annually|/hr|per hour)?"
+        ),
+        (
+            r"(?:USD|US\$|CAD|AUD|EUR|GBP|CA\$|C\$|A\$)\s*\d{1,3}(?:[,\s]\d{3})*(?:\.\d+)?\s*[kK]?"
+            r"\s*(?:-|to|–|—)\s*(?:USD|US\$|CAD|AUD|EUR|GBP|CA\$|C\$|A\$)?\s*"
+            r"\d{1,3}(?:[,\s]\d{3})*(?:\.\d+)?\s*[kK]?"
+            r"\s*(?:/year|per year|annually|/hr|per hour)?"
+        ),
+        (
+            r"(?:[A-Z]{1,3}\$|[$€£])\s?\d{1,3}(?:[,\s]\d{3})*(?:\.\d+)?\s*[kK]?"
+            r"\s*(?:/year|per year|annually|/hr|per hour)"
+        ),
     )
-    return match.group(0) if match else ""
+    for pattern in patterns:
+        match = re.search(pattern, compact, flags=re.IGNORECASE)
+        if match:
+            return re.sub(r"\s+", " ", match.group(0)).strip()
+    return ""
+
+
+def _extract_salary_from_sources(sources: tuple[Any, ...]) -> str:
+    for source in sources:
+        salary = _extract_salary_from_node(source, in_salary_context=False)
+        if salary:
+            return salary
+    return ""
+
+
+def _extract_salary_from_node(node: Any, *, in_salary_context: bool) -> str:
+    if isinstance(node, dict):
+        normalized_keys = {_normalize_salary_key(str(key)): key for key in node}
+        has_salary_key = any(
+            any(token in key for token in SALARY_CONTEXT_TOKENS) for key in normalized_keys
+        )
+        context = in_salary_context or has_salary_key
+
+        # Direct salary strings often appear as a single field.
+        for key, value in node.items():
+            if isinstance(value, str):
+                key_norm = _normalize_salary_key(str(key))
+                if context or any(token in key_norm for token in SALARY_CONTEXT_TOKENS):
+                    salary = _extract_salary_from_text(value)
+                    if salary:
+                        return salary
+
+        if context:
+            min_value, max_value = _find_salary_bounds(node)
+            currency = _find_salary_currency(node)
+            cadence = _find_salary_cadence(node)
+            if min_value is not None and max_value is not None:
+                return _format_salary_range(min_value, max_value, currency, cadence)
+            if min_value is not None:
+                return _format_salary_single(min_value, currency, cadence)
+            if max_value is not None:
+                return _format_salary_single(max_value, currency, cadence)
+
+        for key, value in node.items():
+            key_norm = _normalize_salary_key(str(key))
+            child_context = context or any(token in key_norm for token in SALARY_CONTEXT_TOKENS)
+            salary = _extract_salary_from_node(value, in_salary_context=child_context)
+            if salary:
+                return salary
+        return ""
+
+    if isinstance(node, list):
+        for item in node:
+            salary = _extract_salary_from_node(item, in_salary_context=in_salary_context)
+            if salary:
+                return salary
+        return ""
+
+    if isinstance(node, str):
+        return _extract_salary_from_text(node) if (in_salary_context or node) else ""
+    return ""
+
+
+def _find_salary_bounds(mapping: dict[Any, Any]) -> tuple[float | None, float | None]:
+    min_value: float | None = None
+    max_value: float | None = None
+    for key, value in mapping.items():
+        key_norm = _normalize_salary_key(str(key))
+        if not isinstance(value, str | int | float):
+            continue
+        number = _parse_salary_number(value)
+        if number is None:
+            continue
+        if any(token in key_norm for token in SALARY_MIN_TOKENS):
+            min_value = number if min_value is None else min(min_value, number)
+            continue
+        if any(token in key_norm for token in SALARY_MAX_TOKENS):
+            max_value = number if max_value is None else max(max_value, number)
+            continue
+        if any(token in key_norm for token in SALARY_CONTEXT_TOKENS):
+            if min_value is None:
+                min_value = number
+            elif max_value is None and abs(number - min_value) > 1:
+                max_value = max(number, min_value)
+                min_value = min(number, min_value)
+    return (min_value, max_value)
+
+
+def _find_salary_currency(mapping: dict[Any, Any]) -> str:
+    for key, value in mapping.items():
+        key_norm = _normalize_salary_key(str(key))
+        if any(token in key_norm for token in SALARY_CURRENCY_TOKENS):
+            text = str(value).strip().upper()
+            if text in SALARY_CURRENCY_SYMBOL:
+                return SALARY_CURRENCY_SYMBOL[text]
+            if text in {"$", "€", "£"}:
+                return text
+    return "$"
+
+
+def _find_salary_cadence(mapping: dict[Any, Any]) -> str:
+    for key, value in mapping.items():
+        key_norm = _normalize_salary_key(str(key))
+        if not any(token in key_norm for token in SALARY_CADENCE_TOKENS):
+            continue
+        cadence = str(value).strip().lower()
+        if any(token in cadence for token in ("year", "annual", "annually", "yr")):
+            return "/year"
+        if any(token in cadence for token in ("hour", "hourly", "hr")):
+            return "/hour"
+    return ""
+
+
+def _normalize_salary_key(value: str) -> str:
+    return re.sub(r"[^a-z0-9]", "", value.lower())
+
+
+def _parse_salary_number(value: str | int | float) -> float | None:
+    if isinstance(value, int | float):
+        amount = float(value)
+    else:
+        text = value.strip().replace(",", "")
+        text = text.replace("$", "").replace("€", "").replace("£", "")
+        match = re.search(r"(\d+(?:\.\d+)?)\s*([kK]?)", text)
+        if not match:
+            return None
+        amount = float(match.group(1))
+        if match.group(2):
+            amount *= 1000
+    if amount < 10:
+        return None
+    return amount
+
+
+def _format_salary_number(value: float) -> str:
+    return f"{int(round(value)):,}"
+
+
+def _format_salary_single(value: float, currency_symbol: str, cadence: str) -> str:
+    return f"{currency_symbol}{_format_salary_number(value)}{cadence}"
+
+
+def _format_salary_range(
+    min_value: float,
+    max_value: float,
+    currency_symbol: str,
+    cadence: str,
+) -> str:
+    low = min(min_value, max_value)
+    high = max(min_value, max_value)
+    return (
+        f"{currency_symbol}{_format_salary_number(low)} - "
+        f"{currency_symbol}{_format_salary_number(high)}{cadence}"
+    )
 
 
 def _extract_technologies(text: str) -> list[str]:

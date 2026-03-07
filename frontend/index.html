@@ -16,7 +16,10 @@
       <section class="controls">
         <label for="resume">Resume (PDF or DOCX)</label>
         <input id="resume" type="file" accept=".pdf,.docx" />
-        <button id="run">Run Job Search</button>
+        <div class="actions">
+          <button id="run">Run Job Search</button>
+          <button id="reset" type="button" class="secondary">Reset</button>
+        </div>
         <p id="status" class="status"></p>
       </section>
 
@@ -31,8 +34,11 @@
         <h3 class="title"></h3>
         <p class="company"></p>
         <p class="meta"></p>
+        <div class="badges">
+          <span class="badge work-badge"></span>
+          <span class="badge salary-badge"></span>
+        </div>
         <p class="scores"></p>
-        <p class="summary"></p>
         <div class="links">
           <a class="job-link" target="_blank" rel="noreferrer">Job Posting</a>
           <a class="resume-link" target="_blank" rel="noreferrer">Generated Resume</a>
@@ -40,6 +46,6 @@
       </article>
     </template>
 
-    <script src="app.js?v=20260306a"></script>
+    <script src="app.js?v=20260307i"></script>
   </body>
 </html>

@@ -3,13 +3,19 @@ from __future__ import annotations
 import logging
 import os
 import time
+from collections import Counter
 from pathlib import Path
 from typing import Any
 from urllib.parse import urlparse
 
 from app.models.schemas import JobMatchTile
 from app.tools.ats import evaluate_ats_score
-from app.tools.job_discovery import DiscoveryConfig, discover_jobs
+from app.tools.job_discovery import (
+    DiscoveryConfig,
+    configure_http_cache,
+    discover_jobs,
+    enrich_missing_salaries,
+)
 from app.tools.job_parsing import parse_job_details
 from app.tools.location_resolver import LocationResolver
 from app.tools.resume import parse_resume_sections
@@ -79,6 +85,21 @@ class WorkflowNodes:
             technology_keywords=technologies,
         )
 
+    def _tile_location_label(self, job: dict[str, Any]) -> str:
+        work_type = str(job.get("work_type", "")).strip().lower()
+        location = str(job.get("location", "")).strip()
+        if work_type == "remote":
+            if self.location_resolver.is_dfw_applicable(job):
+                city = self.location_resolver.dfw_city_label(location)
+                return f"{city} Remote" if city else "DFW Remote"
+            return "Remote"
+        if work_type == "hybrid":
+            if self.location_resolver.is_dfw_applicable(job):
+                city = self.location_resolver.dfw_city_label(location)
+                return f"{city} Hybrid" if city else "DFW Hybrid"
+            return "Hybrid"
+        return location or "Unknown"
+
     def _add_error(self, state: WorkflowState, message: str) -> None:
         errors = state.setdefault("errors", [])
         errors.append(message)
@@ -90,6 +111,9 @@ class WorkflowNodes:
         return ""
 
     def _is_valid_discovered_job(self, job: dict[str, Any]) -> bool:
+        return self._discovered_job_invalid_reason(job) is None
+
+    def _discovered_job_invalid_reason(self, job: dict[str, Any]) -> str | None:
         url = str(job.get("job_url", job.get("job_link", ""))).lower()
         parsed = urlparse(url)
         host = parsed.netloc
@@ -103,9 +127,9 @@ class WorkflowNodes:
             "wellfound",
         )
         if not host or any(token in host for token in blocked_hosts):
-            return False
+            return "blocked_or_missing_host"
         if parsed.path.lower().rstrip("/").endswith("/careers/jobs"):
-            return False
+            return "careers_hub_url"
         company_hosts = set()
         discovery_cfg = self.workflow_config.get("job_discovery", {})
         for company in discovery_cfg.get("companies", []):
@@ -124,7 +148,7 @@ class WorkflowNodes:
         }
         if host not in allowed_board_hosts and not any(host.endswith(h) for h in company_hosts):
             if not any(host.endswith(board_host) for board_host in allowed_board_hosts):
-                return False
+                return "host_not_allowed"
         source_provider = str(job.get("source_provider", "")).strip().lower()
         if source_provider not in {
             "greenhouse",
@@ -135,12 +159,18 @@ class WorkflowNodes:
             "icims",
             "taleo",
         } and not any(token in url for token in ("/jobs/", "/job/", "/positions/", "/opening")):
-            return False
+            return "provider_and_path_mismatch"
         description_words = len(str(job.get("description", "")).split())
-        return description_words >= 20
+        if description_words < 20:
+            return "description_too_short"
+        return None
 
     def _run_discovery(self, timeout_seconds: float, use_fallback: bool) -> list[dict[str, Any]]:
         discovery_cfg = self.workflow_config.get("job_discovery", {})
+        configure_http_cache(
+            enabled=bool(discovery_cfg.get("http_cache_enabled", True)),
+            ttl_seconds=float(discovery_cfg.get("http_cache_ttl_seconds", 180.0)),
+        )
         discovered = discover_jobs(
             DiscoveryConfig(
                 companies=[dict(item) for item in discovery_cfg.get("companies", [])],
@@ -151,11 +181,15 @@ class WorkflowNodes:
                 cache_path=str(Path("var/discovery_cache.json")),
                 max_jobs_per_company=int(discovery_cfg.get("max_jobs_per_company", 0)),
                 global_budget_seconds=float(discovery_cfg.get("global_budget_seconds", 0)),
+                company_workers=int(discovery_cfg.get("company_workers", 1)),
             )
         )
         normalized: list[dict[str, Any]] = []
+        validation_reasons = Counter[str]()
         for job in discovered:
-            if not self._is_valid_discovered_job(job):
+            invalid_reason = self._discovered_job_invalid_reason(job)
+            if invalid_reason is not None:
+                validation_reasons[invalid_reason] += 1
                 continue
             title = str(job.get("title", "")).strip()
             link = str(job.get("job_url", job.get("job_link", ""))).strip()
@@ -169,11 +203,58 @@ class WorkflowNodes:
                     "job_link": str(job.get("job_link") or link),
                 }
             )
-        preferred = [job for job in normalized if self._matches_location_preference(job)]
-        return preferred
+        preferred: list[dict[str, Any]] = []
+        review_bucketed: list[dict[str, Any]] = []
+        location_reasons = Counter[str]()
+        for job in normalized:
+            matched, reason = self.location_resolver.match_decision(job)
+            if matched:
+                preferred.append(job)
+            else:
+                location_reasons[reason] += 1
+                if self._should_route_to_review_bucket(reason, job):
+                    review_bucketed.append(
+                        {
+                            **job,
+                            "location_review_bucket": True,
+                            "location_filter_reason": reason,
+                        }
+                    )
+        logger.info(
+            (
+                "job_discovery_pipeline fetched=%s normalized=%s kept=%s review_bucket=%s "
+                "drop_validation=%s drop_location=%s"
+            ),
+            len(discovered),
+            len(normalized),
+            len(preferred),
+            len(review_bucketed),
+            dict(validation_reasons),
+            dict(location_reasons),
+        )
+        combined = [*preferred, *review_bucketed]
+        enriched = enrich_missing_salaries(
+            combined,
+            timeout_seconds=float(discovery_cfg.get("fetch_timeout_seconds", timeout_seconds)),
+            max_lookups=int(discovery_cfg.get("salary_backfill_max_lookups", 60)),
+            workers=int(discovery_cfg.get("salary_backfill_workers", 6)),
+        )
+        return enriched
 
     def _matches_location_preference(self, job: dict[str, Any]) -> bool:
         return self.location_resolver.matches_preference(job)
+
+    def _should_route_to_review_bucket(
+        self,
+        location_reason: str,
+        job: dict[str, Any],
+    ) -> bool:
+        reviewable_reasons = {"location_missing", "location_unresolved", "metro_no_match"}
+        if location_reason not in reviewable_reasons:
+            return False
+        if str(job.get("work_type", "")).strip().lower() == "remote":
+            return False
+        return True
 
     def _repair_count(self, state: WorkflowState, stage: str) -> int:
         repair_counts = state.setdefault("repair_counts", {})
@@ -389,15 +470,28 @@ class WorkflowNodes:
         jobs = state.get("discovered_jobs", [])
         min_jobs = int(self.workflow_config["nodes"]["job_discovery"]["min_job_count"])
         valid_jobs: list[dict[str, Any]] = []
+        invalid_counts = Counter[str]()
         for item in jobs:
-            ok_item, _ = validate_discovered_job(item, REQUIRED_DISCOVERY_KEYS, check_live=False)
+            ok_item, reason = validate_discovered_job(
+                item,
+                REQUIRED_DISCOVERY_KEYS,
+                check_live=False,
+            )
             if ok_item:
                 valid_jobs.append(item)
+            else:
+                invalid_counts[reason] += 1
         ok, reason = verify_discovered_jobs(
             valid_jobs,
             min_jobs,
             REQUIRED_DISCOVERY_KEYS,
             check_live=False,
+        )
+        logger.info(
+            "verify_job_discovery input=%s valid=%s invalid_reasons=%s",
+            len(jobs),
+            len(valid_jobs),
+            dict(invalid_counts),
         )
         if not ok:
             return self._set_verification(state, "job_discovery", False, reason)
@@ -470,10 +564,30 @@ class WorkflowNodes:
             top_k=scoring_top_k,
             scoring_config=self.workflow_config["nodes"]["job_scoring"],
         )
+        below_threshold = [
+            item for item in scored if float(item.get("match_score", 0.0)) < min_score
+        ]
         scored = [item for item in scored if float(item.get("match_score", 0.0)) >= min_score]
         scored = self._diversify_companies(scored)
         if top_k > 0:
             scored = scored[:top_k]
+        top_preview = [
+            {
+                "company": item.get("company", ""),
+                "title": item.get("title", ""),
+                "score": item.get("match_score", 0.0),
+                "debug": item.get("ranking_debug", {}),
+            }
+            for item in scored[:5]
+        ]
+        logger.info(
+            "job_scoring input=%s kept=%s dropped_below_threshold=%s min_score=%s top=%s",
+            len(discovered_jobs),
+            len(scored),
+            len(below_threshold),
+            min_score,
+            top_preview,
+        )
         return {"scored_jobs": scored}
 
     def _diversify_companies(self, jobs: list[dict[str, Any]]) -> list[dict[str, Any]]:
@@ -664,26 +778,27 @@ class WorkflowNodes:
         return {"scored_jobs": repaired}
 
     def tile_construction(self, state: WorkflowState) -> dict[str, Any]:
-        run_id = str(state.get("run_id", "")).strip()
+        run_id = int(state.get("run_id", 0) or 0)
         tiles: list[dict[str, Any]] = []
 
         for job in state.get("scored_jobs", []):
             generated_link = state.get("generated_resumes", {}).get(job["job_link"], "")
+            ats_score = float(job.get("ats_score", 0.0))
             summary = (
                 f"{job['company']} aligns with your profile for {job['title']} "
                 f"with match score {job['match_score']:.1f}, resume alignment "
-                f"{job['resume_alignment']:.1f}, and ATS score {job['ats_score']:.1f}."
+                f"{job['resume_alignment']:.1f}, and ATS score {ats_score:.1f}."
             )
             tile = JobMatchTile(
                 run_id=run_id,
                 company=str(job["company"]),
                 title=str(job["title"]),
-                location=str(job["location"]),
+                location=self._tile_location_label(job),
                 salary=str(job.get("salary") or "") or None,
                 work_type=str(job["work_type"]),
                 match_score=float(job["match_score"]),
                 resume_alignment=float(job["resume_alignment"]),
-                ats_score=float(job["ats_score"]),
+                ats_score=ats_score,
                 job_link=str(job["job_link"]),
                 generated_resume_link=generated_link,
                 summary=summary,
@@ -701,13 +816,13 @@ class WorkflowNodes:
         return self._set_verification(state, "tile_construction", True)
 
     def repair_tile_construction(self, state: WorkflowState) -> dict[str, Any]:
-        run_id = str(state.get("run_id", "")).strip()
+        run_id = int(state.get("run_id", 0) or 0)
         self._inc_repair_count(state, "tile_construction")
         repaired: list[dict[str, Any]] = []
 
         for tile in state.get("tiles", []):
             candidate = {
-                "run_id": tile.get("run_id") or run_id,
+                "run_id": int(tile.get("run_id") or run_id),
                 "company": tile.get("company") or "Unknown Company",
                 "title": tile.get("title") or "Unknown Title",
                 "location": tile.get("location") or "Unknown",

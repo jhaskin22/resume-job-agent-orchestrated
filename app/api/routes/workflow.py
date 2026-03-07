@@ -5,6 +5,8 @@ from fastapi import APIRouter, File, HTTPException, UploadFile
 from fastapi.responses import FileResponse
 
 from app.models.schemas import (
+    GenerateResumeRequest,
+    GenerateResumeResponse,
     RunWorkflowResponse,
     StartWorkflowRunResponse,
     WorkflowRunStatusResponse,
@@ -45,11 +47,31 @@ async def start_workflow_run(resume: Annotated[UploadFile, File(...)]) -> StartW
 
 
 @router.get("/workflow/runs/{run_id}", response_model=WorkflowRunStatusResponse)
-def get_workflow_run(run_id: str) -> WorkflowRunStatusResponse:
+def get_workflow_run(run_id: int) -> WorkflowRunStatusResponse:
     status = run_manager.get_status(run_id)
     if status is None:
         raise HTTPException(status_code=404, detail="Run not found.")
     return status
+
+
+@router.post("/workflow/runs/{run_id}/resume", response_model=GenerateResumeResponse)
+def generate_resume_for_job(run_id: int, request: GenerateResumeRequest) -> GenerateResumeResponse:
+    status = run_manager.get_status(run_id)
+    if status is None:
+        raise HTTPException(status_code=404, detail="Run not found.")
+    try:
+        generated_link = run_manager.generate_resume_for_job(run_id, str(request.job_link))
+    except KeyError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    except Exception as exc:  # noqa: BLE001
+        raise HTTPException(status_code=500, detail=f"Resume generation failed: {exc}") from exc
+    return GenerateResumeResponse(
+        run_id=run_id,
+        job_link=request.job_link,
+        generated_resume_link=generated_link,
+    )
 
 
 @router.get("/resumes/{filename}")

@@ -62,6 +62,12 @@ def test_discover_jobs_multi_provider_ingestion(monkeypatch) -> None:
                         "title": "Software Engineer",
                         "absolute_url": "https://boards.greenhouse.io/acme/jobs/123",
                         "content": "Build backend services with python and aws.",
+                        "salaryRange": {
+                            "minimum": 130000,
+                            "maximum": 170000,
+                            "currency": "USD",
+                            "period": "year",
+                        },
                         "location": {"name": "Remote"},
                     }
                 ]
@@ -82,6 +88,7 @@ def test_discover_jobs_multi_provider_ingestion(monkeypatch) -> None:
                         "externalPath": "/job/plano/engineer/1",
                         "locationsText": "Plano, TX",
                         "bulletFields": "Design distributed systems with kubernetes and terraform.",
+                        "compensation": {"minSalary": 145000, "maxSalary": 190000},
                     }
                 ]
             }
@@ -107,6 +114,7 @@ def test_discover_jobs_multi_provider_ingestion(monkeypatch) -> None:
                 200,
                 "<html><body><h1>Avionics Embedded Software Engineer</h1>"
                 "<p>Responsibilities include firmware and embedded development in C++.</p>"
+                "<p>Salary: $125,000 - $165,000 per year.</p>"
                 "</body></html>",
             )
         return (0, "")
@@ -151,3 +159,43 @@ def test_discover_jobs_multi_provider_ingestion(monkeypatch) -> None:
     assert providers == {"greenhouse", "workday", "taleo"}
     assert all(item.get("url") for item in jobs)
     assert all(item.get("description") for item in jobs)
+    assert all(str(item.get("salary", "")).strip() for item in jobs)
+
+
+def test_greenhouse_enriches_salary_from_detail_when_missing_in_list(monkeypatch) -> None:
+    def fake_get_json(url: str, timeout_seconds: float):
+        if "boards-api.greenhouse.io/v1/boards/fastly/jobs/123" in url:
+            return {
+                "id": 123,
+                "content": (
+                    "<p>Staff Engineer role.</p>"
+                    "<p><strong>Salary:</strong> $211,370 to $253,644 per year.</p>"
+                ),
+                "location": {"name": "Remote - US"},
+                "metadata": [],
+            }
+        if "boards-api.greenhouse.io/v1/boards/fastly/jobs" in url:
+            return {
+                "jobs": [
+                    {
+                        "title": "Staff Engineer - API Services",
+                        "absolute_url": "https://www.fastly.com/about/jobs/apply?gh_jid=123",
+                        "content": "",
+                        "location": {"name": "Remote - US"},
+                    }
+                ]
+            }
+        return None
+
+    monkeypatch.setattr(jd, "_http_get_json", fake_get_json)
+    jobs = jd._greenhouse_jobs(
+        company_name="Fastly",
+        board="fastly",
+        careers_url="https://www.fastly.com/about/careers",
+        default_location="United States",
+        default_work_type="remote",
+        timeout_seconds=2.0,
+    )
+
+    assert len(jobs) == 1
+    assert jobs[0]["salary"] == "$211,370 to $253,644 per year"

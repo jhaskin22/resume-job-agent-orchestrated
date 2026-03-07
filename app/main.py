@@ -3,9 +3,11 @@ from fastapi.middleware.cors import CORSMiddleware
 
 from app.api.router import api_router
 from app.core.config import settings
+from app.core.logging_setup import configure_pipeline_logging
 
 
 def create_app() -> FastAPI:
+    configure_pipeline_logging()
     app = FastAPI(title=settings.app_name)
     app.add_middleware(
         CORSMiddleware,

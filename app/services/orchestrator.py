@@ -1,11 +1,11 @@
 from __future__ import annotations
 
 from pathlib import Path
-from uuid import uuid4
 
 from app.core.config import settings
 from app.core.config_loader import load_yaml
 from app.models.schemas import JobMatchTile, RunWorkflowResponse, WorkflowDiagnostics
+from app.services.run_ids import next_run_id
 from app.workflow.graph import build_workflow
 from app.workflow.io import persist_uploaded_resume
 from app.workflow.nodes import WorkflowNodes
@@ -29,9 +29,9 @@ class ResumeJobOrchestrator:
         resume_filename: str,
         resume_file_bytes: bytes,
         *,
-        run_id: str | None = None,
+        run_id: int | None = None,
     ) -> RunWorkflowResponse:
-        effective_run_id = run_id or str(uuid4())
+        effective_run_id = run_id if run_id is not None else next_run_id()
         uploaded_path = persist_uploaded_resume(
             payload=resume_file_bytes,
             filename=resume_filename,

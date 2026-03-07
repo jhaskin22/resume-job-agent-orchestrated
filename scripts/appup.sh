@@ -7,7 +7,19 @@ mkdir -p "$RUN_DIR"
 
 is_running() {
   local pid="$1"
-  kill -0 "$pid" 2>/dev/null
+  if ! kill -0 "$pid" 2>/dev/null; then
+    return 1
+  fi
+
+  # Treat zombie processes as not running so stale pid files do not block restart.
+  if [[ -r "/proc/$pid/stat" ]]; then
+    local state
+    state="$(awk '{print $3}' "/proc/$pid/stat" 2>/dev/null || true)"
+    [[ "$state" != "Z" ]]
+    return
+  fi
+
+  return 0
 }
 
 wait_for_http() {

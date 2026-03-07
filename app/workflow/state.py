@@ -2,7 +2,7 @@ from typing import Any, TypedDict
 
 
 class WorkflowState(TypedDict, total=False):
-    run_id: str
+    run_id: int
     resume_filename: str
     uploaded_resume_path: str
     resume_file_bytes: bytes

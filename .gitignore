@@ -10,3 +10,9 @@ htmlcov/
 var/generated_resumes/
 var/uploads/
 var/discovery_cache.json
+var/*.log
+var/location_geocode_cache.json
+var/location_unknown_queue.json
+var/run_id_counter.txt
+var/test_location_geocode_cache.json
+var/test_location_unknown_queue.json

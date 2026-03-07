@@ -15,6 +15,14 @@ logger = logging.getLogger(__name__)
 DEFAULT_REGISTRY_PATH = Path("app/config/location_registry.json")
 DEFAULT_GEOCODE_CACHE_PATH = Path("var/location_geocode_cache.json")
 DEFAULT_UNKNOWN_QUEUE_PATH = Path("var/location_unknown_queue.json")
+DFW_CITY_LABELS: tuple[tuple[str, str], ...] = (
+    ("fort worth", "Fort Worth"),
+    ("dallas", "Dallas"),
+    ("plano", "Plano"),
+    ("richardson", "Richardson"),
+    ("arlington", "Arlington"),
+    ("hurst", "Hurst"),
+)
 
 
 @dataclass(slots=True)
@@ -55,9 +63,28 @@ class LocationResolver:
         self._load_geocode_cache()
 
     def matches_preference(self, job: dict[str, Any]) -> bool:
+        matched, _ = self.match_decision(job)
+        return matched
+
+    def is_dfw_applicable(self, job: dict[str, Any]) -> bool:
+        location = str(job.get("location", "")).lower()
+        hints = [str(item).strip().lower() for item in self.preferences.get("location_hints", [])]
+        if any(hint and hint in location for hint in hints):
+            return True
+        matched, reason = self.match_decision(job)
+        return bool(matched and reason in {"metro_alias_match", "metro_geocode_match"})
+
+    def dfw_city_label(self, location: str) -> str:
+        lowered = location.lower()
+        for token, label in DFW_CITY_LABELS:
+            if token in lowered:
+                return label
+        return ""
+
+    def match_decision(self, job: dict[str, Any]) -> tuple[bool, str]:
         enabled = bool(self.preferences.get("enabled", False))
         if not enabled:
-            return True
+            return (True, "location_filter_disabled")
 
         allowed_work_types = {
             str(item).strip().lower()
@@ -67,23 +94,41 @@ class LocationResolver:
         if work_type and work_type not in allowed_work_types:
             return False
         if work_type == "remote":
-            return "remote" in allowed_work_types and self._is_north_america_remote(job)
+            if "remote" not in allowed_work_types:
+                return (False, "work_type_remote_disallowed")
+            if self._is_north_america_remote(job):
+                return (True, "remote_north_america")
+            return (False, "remote_not_north_america")
         if work_type == "hybrid" and "hybrid" not in allowed_work_types:
-            return False
+            return (False, "work_type_hybrid_disallowed")
+        if work_type and work_type not in allowed_work_types:
+            return (False, "work_type_disallowed")
 
         metro_target = str(self.preferences.get("metro", "dfw")).strip().lower()
         city_tokens = self._extract_location_candidates(job)
+        if not city_tokens:
+            return (False, "location_missing")
         for token in city_tokens:
             matched = self._lookup_alias(token)
-            if matched and metro_target in matched.metros:
-                return True
+            if matched:
+                if metro_target in matched.metros:
+                    return (True, "metro_alias_match")
+                return (False, "metro_alias_outside_target")
 
         # Unknown cities: deterministically geocode and cache.
+        saw_unresolved = False
         for token in city_tokens:
-            if self._maybe_geocode_and_match(token, metro_target):
-                return True
+            geocode_result = self._maybe_geocode_and_match(token, metro_target)
+            if geocode_result == "match":
+                return (True, "metro_geocode_match")
+            if geocode_result == "unresolved":
+                saw_unresolved = True
+            if geocode_result == "outside":
+                return (False, "metro_geocode_outside_target")
 
-        return False
+        if saw_unresolved:
+            return (False, "location_unresolved")
+        return (False, "metro_no_match")
 
     def _is_north_america_remote(self, job: dict[str, Any]) -> bool:
         location = str(job.get("location", ""))
@@ -145,9 +190,11 @@ class LocationResolver:
     def _lookup_alias(self, token: str) -> LocationRecord | None:
         return self.alias_index.get(token)
 
-    def _maybe_geocode_and_match(self, token: str, metro_target: str) -> bool:
+    def _maybe_geocode_and_match(self, token: str, metro_target: str) -> str:
         if token in self.alias_index:
-            return metro_target in self.alias_index[token].metros
+            if metro_target in self.alias_index[token].metros:
+                return "match"
+            return "outside"
 
         cached = self.geocode_cache.get(token)
         if cached is None:
@@ -157,7 +204,7 @@ class LocationResolver:
 
         if not cached.get("ok", False):
             self._append_unknown(token)
-            return False
+            return "unresolved"
 
         lat = float(cached["lat"])
         lon = float(cached["lon"])
@@ -174,8 +221,8 @@ class LocationResolver:
                 )
                 self.alias_index[token] = record
                 self.canonical_index[token] = record
-                return True
-        return False
+                return "match"
+        return "outside"
 
     def _load_registry(self) -> None:
         if not self.registry_path.exists():

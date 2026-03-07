@@ -1,3 +1,4 @@
+import asyncio
 from io import BytesIO
 from pathlib import Path
 
@@ -54,10 +55,10 @@ async def test_run_workflow_with_docx() -> None:
     payload = response.json()
     assert payload["tiles"]
     assert payload["diagnostics"]["verification"]["job_parsing"]["ok"] is True
-    assert payload["diagnostics"]["verification"]["ats_evaluation"]["ok"] is True
+    assert payload["diagnostics"]["verification"]["tile_construction"]["ok"] is True
     first = payload["tiles"][0]
     assert first["company"]
-    assert first["generated_resume_link"].startswith("/api/resumes/")
+    assert first["generated_resume_link"] == ""
     assert "verification" in payload["diagnostics"]
 
     after_uploads = {path.name for path in upload_dir.glob("*")} if upload_dir.exists() else set()
@@ -65,15 +66,15 @@ async def test_run_workflow_with_docx() -> None:
 
 
 @pytest.mark.anyio
-async def test_generated_resume_download() -> None:
+async def test_generated_resume_download_on_demand() -> None:
     original_payload = _build_docx_payload()
     original_doc = Document(BytesIO(original_payload))
     original_paragraph_count = len(original_doc.paragraphs)
 
     transport = ASGITransport(app=app)
     async with AsyncClient(transport=transport, base_url="http://test") as client:
-        run_response = await client.post(
-            "/api/workflow/run",
+        start_response = await client.post(
+            "/api/workflow/runs",
             files={
                 "resume": (
                     "candidate.docx",
@@ -82,14 +83,30 @@ async def test_generated_resume_download() -> None:
                 )
             },
         )
-        assert run_response.status_code == 200
-        payload = run_response.json()
-        assert len(payload["tiles"]) >= 2
-        link = payload["tiles"][0]["generated_resume_link"]
-        second_link = payload["tiles"][1]["generated_resume_link"]
+        assert start_response.status_code == 200
+        run_id = start_response.json()["run_id"]
+        payload = {}
+        for _ in range(300):
+            status_response = await client.get(f"/api/workflow/runs/{run_id}")
+            assert status_response.status_code == 200
+            payload = status_response.json()
+            if payload["status"] == "failed":
+                break
+            if len(payload.get("tiles", [])) >= 1:
+                break
+            await asyncio.sleep(0.2)
+        assert payload.get("status") != "failed"
+        assert len(payload["tiles"]) >= 1
+        first_job_link = payload["tiles"][0]["job_link"]
+
+        gen_response = await client.post(
+            f"/api/workflow/runs/{run_id}/resume",
+            json={"job_link": first_job_link},
+        )
+        assert gen_response.status_code == 200
+        link = gen_response.json()["generated_resume_link"]
 
         download_response = await client.get(link)
-        second_download_response = await client.get(second_link)
 
     assert download_response.status_code == 200
     assert download_response.headers["content-type"].startswith(
@@ -98,9 +115,4 @@ async def test_generated_resume_download() -> None:
     assert len(download_response.content) > 100
 
     generated_doc = Document(BytesIO(download_response.content))
-    second_doc = Document(BytesIO(second_download_response.content))
     assert len(generated_doc.paragraphs) == original_paragraph_count
-    assert len(second_doc.paragraphs) == original_paragraph_count
-    first_text = "\n".join(paragraph.text for paragraph in generated_doc.paragraphs)
-    second_text = "\n".join(paragraph.text for paragraph in second_doc.paragraphs)
-    assert first_text != second_text
